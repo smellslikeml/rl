@@ -134,7 +134,7 @@ torch.manual_seed(0)
 ```
 
 ```
-<torch._C.Generator object at 0x7f7e9b9343b0>
+<torch._C.Generator object at 0x7f8f0bd2c250>
 ```
 
 ## The canonical VLA schema
