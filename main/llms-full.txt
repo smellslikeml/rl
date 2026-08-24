@@ -33075,7 +33075,7 @@ Proxy to `zero()`.
 
 # Trajectory
 
-*class*torchrl.data.Trajectory(*data: 'TensorDictBase' = <property object at 0x7fa52351a5c0>*, ***, *batch_size*, *device=None*, *names=None*)[[source]](../../_modules/torchrl/data/replay_buffers/query.html#Trajectory)
+*class*torchrl.data.Trajectory(*data: 'TensorDictBase' = <property object at 0x7f4cdea0e250>*, ***, *batch_size*, *device=None*, *names=None*)[[source]](../../_modules/torchrl/data/replay_buffers/query.html#Trajectory)
 
 cat(*dim: int = 0*, ***, *out=None*)
 
@@ -45690,7 +45690,7 @@ Yields:
 
 # ContentBase
 
-*class*torchrl.data.llm.ContentBase(*type: "Literal['text'*, *'image'*, *'audio'*, *'video'*, *'file'*, *'function_call']" = <function _wrap_td_method.<locals>.wrapped_func at 0x7fa52651e160>*, *text: 'str | None' = None*, *url: 'str | None' = None*, *data: 'str | None' = None*, *mime_type: 'str | None' = None*, *name: 'str | None' = None*, *size: 'int | None' = None*, *function_name: 'str | None' = None*, *function_args: 'dict | None' = None*, ***, *batch_size*, *device=None*, *names=None*)[[source]](../../_modules/torchrl/data/llm/history.html#ContentBase)
+*class*torchrl.data.llm.ContentBase(*type: "Literal['text'*, *'image'*, *'audio'*, *'video'*, *'file'*, *'function_call']" = <function _wrap_td_method.<locals>.wrapped_func at 0x7f4ce155e160>*, *text: 'str | None' = None*, *url: 'str | None' = None*, *data: 'str | None' = None*, *mime_type: 'str | None' = None*, *name: 'str | None' = None*, *size: 'int | None' = None*, *function_name: 'str | None' = None*, *function_args: 'dict | None' = None*, ***, *batch_size*, *device=None*, *names=None*)[[source]](../../_modules/torchrl/data/llm/history.html#ContentBase)
 
 cat(*dim: int = 0*, ***, *out=None*)
 
@@ -201794,7 +201794,7 @@ registered hooks while the latter silently ignores them.
 
 # DreamerV3MLP
 
-*class*torchrl.modules.DreamerV3MLP(*in_features: int*, *out_features: int*, *depth: int = 3*, *num_cells: int = 1024*, *outscale: float = 1.0*, *norm_eps: float = 0.0001*, *device=None*)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#DreamerV3MLP)
+*class*torchrl.modules.DreamerV3MLP(*in_features: int*, *out_features: int*, *depth: int = 3*, *num_cells: int = 1024*, *outscale: float = 1.0*, *norm_eps: float = 0.0001*, *device=None*)[[source]](../../_modules/torchrl/modules/models/model_based.html#DreamerV3MLP)
 
 RMS-normalized multilayer perceptron used by DreamerV3 heads.
 
@@ -201820,7 +201820,7 @@ Examples
 torch.Size([3, 4])
 ```
 
-forward(**inputs: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#DreamerV3MLP.forward)
+forward(**inputs: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#DreamerV3MLP.forward)
 
 Define the computation performed at every call.
 
@@ -204086,7 +204086,7 @@ Apply the signed-parabolic inverse to `value`.
 
 # SymExpTwoHot
 
-*class*torchrl.modules.SymExpTwoHot(*num_bins: int = 255*)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#SymExpTwoHot)
+*class*torchrl.modules.SymExpTwoHot(*num_bins: int = 255*)[[source]](../../_modules/torchrl/modules/models/model_based.html#SymExpTwoHot)
 
 DreamerV3 categorical scalar representation.
 
@@ -204113,19 +204113,19 @@ Examples
 True
 ```
 
-decode(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#SymExpTwoHot.decode)
+decode(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#SymExpTwoHot.decode)
 
 Decode categorical logits to raw scalar values.
 
-encode(*target: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#SymExpTwoHot.encode)
+encode(*target: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#SymExpTwoHot.encode)
 
 Encode raw scalar targets as two-hot categorical targets.
 
-forward(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#SymExpTwoHot.forward)
+forward(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#SymExpTwoHot.forward)
 
 Decode logits and retain a trailing scalar event dimension.
 
-loss(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *target: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#SymExpTwoHot.loss)
+loss(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *target: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#SymExpTwoHot.loss)
 
 Compute two-hot cross entropy against raw scalar targets.
 
@@ -227093,7 +227093,7 @@ Examples
 >>> from torchrl.modules import MLP, SafeSequential, WorldModelWrapper
 >>> from torchrl.modules.distributions.continuous import TanhNormal
 >>> from torchrl.modules.models.model_based import DreamerActor
->>> from torchrl.modules.models.dreamer_v3 import RSSMPriorV3
+>>> from torchrl.modules.models.model_based import RSSMPriorV3
 >>> from torchrl.objectives import DreamerV3ActorLoss
 >>> from torchrl.objectives.utils import ValueEstimators
 >>> from torchrl.testing.mocking_classes import ContinuousActionConvMockEnv
@@ -250954,7 +250954,7 @@ See also
 
 # torchrl.objectives.two_hot_cross_entropy
 
-torchrl.objectives.two_hot_cross_entropy(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *target: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *bins: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#two_hot_cross_entropy)
+torchrl.objectives.two_hot_cross_entropy(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *target: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *bins: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#two_hot_cross_entropy)
 
 Return two-hot cross entropy for raw scalar targets.
 
@@ -250986,7 +250986,7 @@ tensor([1.0986, 1.0986])
 
 # torchrl.objectives.two_hot_decode
 
-torchrl.objectives.two_hot_decode(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *bins: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#two_hot_decode)
+torchrl.objectives.two_hot_decode(*logits: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *bins: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#two_hot_decode)
 
 Decode logits over a raw-value support to their scalar expectation.
 
@@ -251016,7 +251016,7 @@ tensor([0.2500])
 
 # torchrl.objectives.two_hot_encode
 
-torchrl.objectives.two_hot_encode(*x: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *bins: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/dreamer_v3.html#two_hot_encode)
+torchrl.objectives.two_hot_encode(*x: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*, *bins: [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)*) → [Tensor](https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor)[[source]](../../_modules/torchrl/modules/models/model_based.html#two_hot_encode)
 
 Encode raw scalar values on a sorted two-hot support.
 
