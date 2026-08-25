@@ -9,6 +9,7 @@ Loss modules for actor-critic algorithms.
     :toctree: generated/
     :template: rl_template_noinherit.rst
 
+    AFULoss
     DDPGLoss
     SACLoss
     TQCLoss

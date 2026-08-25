@@ -5,6 +5,7 @@
 
 from torchrl.objectives.a2c import A2CLoss
 from torchrl.objectives.act import ACTLoss
+from torchrl.objectives.afu import AFULoss
 from torchrl.objectives.bc import BCLoss
 from torchrl.objectives.common import add_random_module, AUTO_LOSS_MASK_KEYS, LossModule
 from torchrl.objectives.cql import CQLLoss, DiscreteCQLLoss
@@ -59,6 +60,7 @@ from torchrl.objectives.world_model_loss import WorldModelLoss
 __all__ = [
     "A2CLoss",
     "ACTLoss",
+    "AFULoss",
     "BCLoss",
     "CQLLoss",
     "DiffusionBCLoss",
