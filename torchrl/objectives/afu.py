@@ -45,10 +45,16 @@ class _ProjectedActionGradient(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         direction, condition = ctx.saved_tensors
+        # The gradient reaching this Function is dL/da_s = -c * grad_{a_s} Q (c > 0),
+        # because the actor loss is ``alpha * log_prob - Q`` (Q enters with a minus
+        # sign). AFU-beta projects when the *Q* gradient points away from the mode,
+        # i.e. ``grad_Q . direction < 0``; since ``grad_output = -c * grad_Q`` that is
+        # equivalent to ``grad_output . direction > 0``. (Testing ``dot < 0`` here
+        # would invert the operator and strip helpful components instead.)
         dot = (grad_output * direction).sum(-1, keepdim=True)
         denom = direction.square().sum(-1, keepdim=True)
         denom = denom.clamp_min(torch.finfo(direction.dtype).eps)
-        project = condition.unsqueeze(-1) & (dot < 0)
+        project = condition.unsqueeze(-1) & (dot > 0)
         grad_output = grad_output - torch.where(
             project, dot / denom * direction, torch.zeros_like(grad_output)
         )
@@ -106,7 +112,7 @@ class AFULoss(SACLoss):
     - ``"beta"`` (AFU-:math:`\beta`): adds a deterministic mode predictor
       :math:`\mu_\zeta` trained by regression on the buffer and actor-sampled
       actions whose Q-value exceeds :math:`\min_i V_{\varphi_i}(s)`
-      (Eq. (10)), and projects the chain-rule factor
+      (Eq. (8)), and projects the chain-rule factor
       :math:`\nabla_{a_s} Q_\psi(s, a_s)` of the actor gradient onto the
       orthogonal complement of :math:`\mu_\zeta(s) - a_s` whenever it points
       away from the predicted mode and
@@ -625,7 +631,7 @@ class AFULoss(SACLoss):
     def mode_loss(
         self, tensordict: TensorDictBase
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Mode predictor loss of AFU-beta (Eq. (10) of the paper)."""
+        """Mode predictor loss of AFU-beta (Eq. (8) of the paper)."""
         if self.variant != "beta":
             raise RuntimeError(
                 "AFULoss.mode_loss is only available with variant='beta'."
@@ -684,9 +690,16 @@ class AFULoss(SACLoss):
         buffer_error = (mode - buffer_action).square().mean(-1)
         sampled_error = (mode - sampled_action).square().mean(-1)
         selected_count = buffer_selected + sampled_selected
-        loss_mode = (
-            buffer_error * buffer_selected + sampled_error * sampled_selected
-        ) / selected_count.clamp_min(1)
+        # Eq. (8): a single mean over ALL selected (s, a) pairs in the batch, each
+        # weighted 1/|M(B)|. Sum the selected squared errors per sample, then
+        # rescale by n_samples / |M(B)| so the per-sample mean reduction below
+        # (which divides by n_samples) yields the /|M(B)| of Eq. (8). The scaling
+        # keeps the per-sample shape the loss contract expects. The previous
+        # /selected_count.clamp_min(1) per-sample average under-weighted pairs from
+        # multi-selected samples and diluted the loss with unselected samples.
+        selected_error = buffer_error * buffer_selected + sampled_error * sampled_selected
+        total_pairs = selected_count.sum().clamp_min(1)
+        loss_mode = selected_error * (selected_error.numel() / total_pairs)
         loss_mode = self._reduce_loss(loss_mode, tensordict=tensordict, weights=weights)
         return loss_mode, {"mode_selected": selected_count.detach()}
 

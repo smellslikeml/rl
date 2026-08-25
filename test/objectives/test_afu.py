@@ -334,27 +334,31 @@ class TestAFU:
         out = project(action, direction, condition)
         torch.testing.assert_close(out, action.detach())
 
-        # Sample 0: v . d = -1 < 0 and the condition holds -> the component
-        # along d is removed: (-1, 3) -> (0, 3).
-        # Sample 1: v . d = 5 > 0 -> the gradient is left unchanged.
-        out.backward(torch.tensor([[-1.0, 3.0], [2.0, 3.0]]))
+        # The gradient reaching this Function in the actor loss is
+        # dL/da = -c * grad_Q (c > 0), since the loss is `alpha*log_prob - Q`.
+        # AFU-beta projects when the *Q* gradient points away from the mode,
+        # grad_Q . d < 0, i.e. when the incoming gradient . d > 0.
+        # Sample 0: incoming (1, -3), d (1, 0) -> dot = +1 > 0 -> project, remove
+        #   the component along d: (1, -3) - 1*(1, 0) = (0, -3).
+        # Sample 1: incoming (-2, -3), d (1, 1) -> dot = -5 < 0 -> unchanged.
+        out.backward(torch.tensor([[1.0, -3.0], [-2.0, -3.0]]))
         torch.testing.assert_close(
-            action.grad, torch.tensor([[0.0, 3.0], [2.0, 3.0]])
+            action.grad, torch.tensor([[0.0, -3.0], [-2.0, -3.0]])
         )
 
-        # When the condition does not hold, the gradient is left unchanged
-        # even if v . d < 0.
+        # When the condition (Q < min_i V) does not hold, the gradient is left
+        # unchanged even when the sign would otherwise trigger projection.
         action2 = torch.tensor([1.0, 2.0], requires_grad=True)
         out2 = project(action2, direction[0], torch.tensor(False))
-        out2.backward(torch.tensor([-1.0, 3.0]))
-        torch.testing.assert_close(action2.grad, torch.tensor([-1.0, 3.0]))
+        out2.backward(torch.tensor([1.0, -3.0]))
+        torch.testing.assert_close(action2.grad, torch.tensor([1.0, -3.0]))
 
         # A zero direction never divides by zero and leaves the gradient
-        # unchanged.
+        # unchanged (dot == 0 also never triggers projection).
         action3 = torch.tensor([1.0, 2.0], requires_grad=True)
         out3 = project(action3, torch.zeros(2), torch.tensor(True))
-        out3.backward(torch.tensor([-1.0, 3.0]))
-        torch.testing.assert_close(action3.grad, torch.tensor([-1.0, 3.0]))
+        out3.backward(torch.tensor([1.0, -3.0]))
+        torch.testing.assert_close(action3.grad, torch.tensor([1.0, -3.0]))
 
     def test_beta_forward_backward(self):
         # The beta variant adds the mode-predictor loss and routes the actor
