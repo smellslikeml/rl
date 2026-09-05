@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-09-05T06:10:01.617000+00:00",
+  "last_updated": "2026-09-05T18:06:55.362855+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
@@ -22,7 +22,7 @@
     {
       "date": "2026-09-05",
       "orchestrator_ran": true,
-      "orchestrator_status": "pending",
+      "orchestrator_status": "queued",
       "orchestrator_url": "https://github.com/smellslikeml/rl/actions/runs/33948975551",
       "orchestrator_run_id": 33948975551,
       "workflows": {
