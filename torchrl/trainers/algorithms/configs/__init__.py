@@ -20,6 +20,10 @@ except ImportError as e:
         "Please install them with: pip install 'torchrl[utils]' or pip install hydra-core omegaconf"
     ) from e
 
+from torchrl.trainers.algorithms.configs.checkpoint import (
+    CheckpointConfig,
+    CheckpointRotationConfig,
+)
 from torchrl.trainers.algorithms.configs.collectors import (
     # New canonical config names
     AsyncCollectorConfig,
@@ -47,10 +51,12 @@ from torchrl.trainers.algorithms.configs.data import (
     SliceSamplerWithoutReplacementConfig,
     StorageEnsembleConfig,
     StorageEnsembleWriterConfig,
+    StreamingSliceSamplerConfig,
     TensorDictReplayBufferConfig,
     TensorStorageConfig,
     TransitionConfig,
 )
+from torchrl.trainers.algorithms.configs.entrypoint import instantiate_trainer
 from torchrl.trainers.algorithms.configs.envs import (
     BatchedEnvConfig,
     EnvConfig,
@@ -81,6 +87,8 @@ from torchrl.trainers.algorithms.configs.hooks import (
     BatchSubSamplerConfig,
     ClearCudaCacheConfig,
     CountFramesLogConfig,
+    DreamerV3OptimizationStepperConfig,
+    DreamerV3UpdateRatioConfig,
     EarlyStoppingConfig,
     HookConfig,
     LogScalarConfig,
@@ -98,10 +106,16 @@ from torchrl.trainers.algorithms.configs.logging import (
 from torchrl.trainers.algorithms.configs.modules import (
     AdditiveGaussianModuleConfig,
     ConvNetConfig,
+    DreamerV3DiscreteActorConfig,
+    DreamerV3ImageDecoderConfig,
+    DreamerV3ImageEncoderConfig,
+    DreamerV3MLPConfig,
+    DreamerV3SeededPolicyConfig,
     MLPConfig,
     ModelConfig,
     QMixerNetworkConfig,
     QValueModelConfig,
+    RSSMStateEstimatorV3Config,
     TanhModuleConfig,
     TanhNormalModelConfig,
     TensorDictModuleConfig,
@@ -114,6 +128,7 @@ from torchrl.trainers.algorithms.configs.objectives import (
     CQLLossConfig,
     DDPGLossConfig,
     DQNLossConfig,
+    DreamerV3LossConfig,
     GAEConfig,
     HardUpdateConfig,
     IQLLossConfig,
@@ -131,6 +146,7 @@ from torchrl.trainers.algorithms.configs.trainers import (
     CQLTrainerConfig,
     DDPGTrainerConfig,
     DQNTrainerConfig,
+    GRPOTrainerConfig,
     IQLTrainerConfig,
     OfflineToOnlineTrainerConfig,
     OnPolicyTrainerConfig,
@@ -157,6 +173,7 @@ from torchrl.trainers.algorithms.configs.transforms import (
     CropConfig,
     DeviceCastTransformConfig,
     DiscreteActionProjectionConfig,
+    DoneTransformConfig,
     DoubleToFloatConfig,
     DTypeCastTransformConfig,
     EndOfLifeTransformConfig,
@@ -170,6 +187,7 @@ from torchrl.trainers.algorithms.configs.transforms import (
     HashConfig,
     InitTrackerConfig,
     KLRewardTransformConfig,
+    LastActionConfig,
     LineariseRewardsConfig,
     ModuleTransformConfig,
     MultiActionConfig,
@@ -216,6 +234,7 @@ from torchrl.trainers.algorithms.configs.utils import (
     AdamConfig,
     AdamWConfig,
     ASGDConfig,
+    DreamerV3OptimizerConfig,
     LBFGSConfig,
     LionConfig,
     NAdamConfig,
@@ -258,6 +277,7 @@ __all__ = [
     "AdadeltaConfig",
     "AdagradConfig",
     "ASGDConfig",
+    "DreamerV3OptimizerConfig",
     "LBFGSConfig",
     "LionConfig",
     "NAdamConfig",
@@ -298,6 +318,12 @@ __all__ = [
     "VmasEnvConfig",
     # Networks and Models
     "ConvNetConfig",
+    "DreamerV3ImageDecoderConfig",
+    "DreamerV3ImageEncoderConfig",
+    "DreamerV3MLPConfig",
+    "DreamerV3DiscreteActorConfig",
+    "DreamerV3SeededPolicyConfig",
+    "RSSMStateEstimatorV3Config",
     "MLPConfig",
     "ModelConfig",
     "TanhModuleConfig",
@@ -326,6 +352,7 @@ __all__ = [
     "CropConfig",
     "DeviceCastTransformConfig",
     "DiscreteActionProjectionConfig",
+    "DoneTransformConfig",
     "DoubleToFloatConfig",
     "DTypeCastTransformConfig",
     "EndOfLifeTransformConfig",
@@ -338,6 +365,7 @@ __all__ = [
     "HashConfig",
     "InitTrackerConfig",
     "KLRewardTransformConfig",
+    "LastActionConfig",
     "LineariseRewardsConfig",
     "ModuleTransformConfig",
     "MultiActionConfig",
@@ -398,11 +426,13 @@ __all__ = [
     "SamplerWithoutReplacementConfig",
     "SliceSamplerConfig",
     "SliceSamplerWithoutReplacementConfig",
+    "StreamingSliceSamplerConfig",
     # Losses
     "A2CLossConfig",
     "CQLLossConfig",
     "DDPGLossConfig",
     "DQNLossConfig",
+    "DreamerV3LossConfig",
     "IQLLossConfig",
     "LossConfig",
     "PPOLossConfig",
@@ -426,12 +456,15 @@ __all__ = [
     "SACTrainerConfig",
     "TD3TrainerConfig",
     "TrainerConfig",
+    "GRPOTrainerConfig",
     # Hooks
     "HookConfig",
     "BatchSubSamplerConfig",
     "ClearCudaCacheConfig",
     "CountFramesLogConfig",
     "EarlyStoppingConfig",
+    "DreamerV3OptimizationStepperConfig",
+    "DreamerV3UpdateRatioConfig",
     "LogScalarConfig",
     "LogTimingConfig",
     "RewardNormalizerConfig",
@@ -442,6 +475,10 @@ __all__ = [
     "TensorboardLoggerConfig",
     "TrackioLoggerConfig",
     "WandbLoggerConfig",
+    # Checkpointing
+    "CheckpointConfig",
+    "CheckpointRotationConfig",
+    "instantiate_trainer",
     # Weight Updaters
     "WeightUpdaterConfig",
     "VanillaWeightUpdaterConfig",
@@ -510,6 +547,30 @@ def _register_configs():
 
     # Network configs
     cs.store(group="network", name="mlp", node=MLPConfig)
+    cs.store(group="network", name="dreamer_v3_mlp", node=DreamerV3MLPConfig)
+    cs.store(
+        group="network",
+        name="dreamer_v3_seeded_policy",
+        node=DreamerV3SeededPolicyConfig,
+    )
+    cs.store(
+        group="network",
+        name="dreamer_v3_discrete_actor",
+        node=DreamerV3DiscreteActorConfig,
+    )
+    cs.store(
+        group="network", name="rssm_state_estimator_v3", node=RSSMStateEstimatorV3Config
+    )
+    cs.store(
+        group="network",
+        name="dreamer_v3_image_encoder",
+        node=DreamerV3ImageEncoderConfig,
+    )
+    cs.store(
+        group="network",
+        name="dreamer_v3_image_decoder",
+        node=DreamerV3ImageDecoderConfig,
+    )
     cs.store(group="network", name="convnet", node=ConvNetConfig)
     cs.store(group="network", name="qmixer", node=QMixerNetworkConfig)
     cs.store(group="network", name="vdn_mixer", node=VDNMixerNetworkConfig)
@@ -539,6 +600,7 @@ def _register_configs():
     cs.store(group="transform", name="noop_reset", node=NoopResetEnvConfig)
     cs.store(group="transform", name="step_counter", node=StepCounterConfig)
     cs.store(group="transform", name="expand_as", node=ExpandAsConfig)
+    cs.store(group="transform", name="done", node=DoneTransformConfig)
     cs.store(group="transform", name="compose", node=ComposeConfig)
     cs.store(group="transform", name="double_to_float", node=DoubleToFloatConfig)
     cs.store(group="transform", name="to_tensor_image", node=ToTensorImageConfig)
@@ -583,6 +645,7 @@ def _register_configs():
         node=RandomCropTensorDictConfig,
     )
     cs.store(group="transform", name="init_tracker", node=InitTrackerConfig)
+    cs.store(group="transform", name="last_action", node=LastActionConfig)
     cs.store(group="transform", name="rename", node=RenameTransformConfig)
     cs.store(group="transform", name="reward2go", node=Reward2GoTransformConfig)
     cs.store(group="transform", name="action_mask", node=ActionMaskConfig)
@@ -633,6 +696,7 @@ def _register_configs():
     cs.store(group="loss", name="cql", node=CQLLossConfig)
     cs.store(group="loss", name="ddpg", node=DDPGLossConfig)
     cs.store(group="loss", name="dqn", node=DQNLossConfig)
+    cs.store(group="loss", name="dreamer_v3", node=DreamerV3LossConfig)
     cs.store(group="loss", name="iql", node=IQLLossConfig)
     cs.store(group="loss", name="ppo", node=PPOLossConfig)
     cs.store(group="loss", name="mixer", node=QMixerLossConfig)
@@ -676,6 +740,11 @@ def _register_configs():
         name="slice_without_replacement",
         node=SliceSamplerWithoutReplacementConfig,
     )
+    cs.store(
+        group="sampler",
+        name="streaming_slice",
+        node=StreamingSliceSamplerConfig,
+    )
     cs.store(group="storage", name="lazy_stack", node=LazyStackStorageConfig)
     cs.store(group="storage", name="list", node=ListStorageConfig)
     cs.store(group="storage", name="tensor", node=TensorStorageConfig)
@@ -713,6 +782,7 @@ def _register_configs():
     cs.store(group="trainer", name="reinforce", node=ReinforceTrainerConfig)
     cs.store(group="trainer", name="sac", node=SACTrainerConfig)
     cs.store(group="trainer", name="td3", node=TD3TrainerConfig)
+    cs.store(group="trainer", name="grpo", node=GRPOTrainerConfig)
 
     # =============================================================================
     # Hook Configurations
@@ -721,6 +791,11 @@ def _register_configs():
     cs.store(group="hook", name="batch_subsampler", node=BatchSubSamplerConfig)
     cs.store(group="hook", name="clear_cuda_cache", node=ClearCudaCacheConfig)
     cs.store(group="hook", name="count_frames_log", node=CountFramesLogConfig)
+    cs.store(
+        group="hook",
+        name="dreamer_v3_optimization",
+        node=DreamerV3OptimizationStepperConfig,
+    )
     cs.store(group="hook", name="early_stopping", node=EarlyStoppingConfig)
     cs.store(group="hook", name="log_scalar", node=LogScalarConfig)
     cs.store(group="hook", name="log_timing", node=LogTimingConfig)
@@ -732,6 +807,7 @@ def _register_configs():
     # =============================================================================
 
     cs.store(group="optimizer", name="adam", node=AdamConfig)
+    cs.store(group="optimizer", name="dreamer_v3", node=DreamerV3OptimizerConfig)
     cs.store(group="optimizer", name="adamw", node=AdamWConfig)
     cs.store(group="optimizer", name="adamax", node=AdamaxConfig)
     cs.store(group="optimizer", name="adadelta", node=AdadeltaConfig)
@@ -754,6 +830,13 @@ def _register_configs():
     cs.store(group="logger", name="tensorboard", node=TensorboardLoggerConfig)
     cs.store(group="logger", name="trackio", node=TrackioLoggerConfig)
     cs.store(group="logger", name="csv", node=CSVLoggerConfig)
+
+    # =============================================================================
+    # Checkpoint Configurations
+    # =============================================================================
+
+    cs.store(group="checkpoint", name="base", node=CheckpointConfig)
+    cs.store(group="checkpoint_rotation", name="base", node=CheckpointRotationConfig)
     cs.store(group="logger", name="base", node=LoggerConfig)
 
     # =============================================================================

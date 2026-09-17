@@ -9,6 +9,12 @@ from .a2c import A2CTrainer
 from .cql import CQLTrainer
 from .ddpg import DDPGTrainer
 from .dqn import DQNTrainer
+from .dreamer_v3 import (
+    DreamerV3OptimizationStepper,
+    DreamerV3Optimizer,
+    DreamerV3UpdateRatio,
+)
+from .grpo import GRPOTrainer
 from .iql import IQLTrainer
 from .offline_to_online import OfflineToOnlineTrainer
 from .on_policy import OnPolicyTrainer
@@ -22,6 +28,10 @@ __all__ = [
     "CQLTrainer",
     "DDPGTrainer",
     "DQNTrainer",
+    "DreamerV3OptimizationStepper",
+    "DreamerV3Optimizer",
+    "DreamerV3UpdateRatio",
+    "GRPOTrainer",
     "IQLTrainer",
     "OfflineToOnlineTrainer",
     "OnPolicyTrainer",

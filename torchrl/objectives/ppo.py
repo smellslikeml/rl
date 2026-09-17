@@ -28,8 +28,17 @@ from tensordict.nn import (
 from tensordict.utils import NestedKey
 from torch import distributions as d
 
-from torchrl._utils import _standardize, logger as torchrl_logger, VERBOSE
-from torchrl.modules.distributions.utils import composite_entropy, sample_and_log_prob
+from torchrl._utils import _standardize
+from torchrl.modules.distributions.utils import (
+    _warn_mc_entropy,
+    _warn_mc_kl,
+    composite_entropy,
+    has_analytic_entropy,
+    has_analytic_kl,
+    is_dynamo_compiling,
+    sample_and_log_prob,
+)
+from torchrl.modules.value_norm import ValueNorm
 from torchrl.objectives.common import LossModule
 from torchrl.objectives.utils import (
     _cache_values,
@@ -38,6 +47,7 @@ from torchrl.objectives.utils import (
     _maybe_add_or_extend_key,
     _maybe_get_or_select,
     _sum_td_features,
+    _valid_value_target_rows,
     _validate_clip_epsilon,
     dispatch_value_estimator,
     distance_loss,
@@ -173,6 +183,22 @@ class PPOLoss(LossModule):
         normalize_advantage_exclude_dims (Tuple[int], optional): dimensions to exclude from the advantage
             standardization. Negative dimensions are valid. This is useful in multiagent (or multiobjective) settings
             where the agent (or objective) dimension may be excluded from the reductions. Default: ().
+        advantage_norm (ValueNorm, optional): a stateful
+            :class:`~torchrl.modules.ValueNorm` used to rescale the advantage,
+            e.g. :class:`~torchrl.modules.PercentileValueNorm` for
+            DreamerV3-style return normalization. The advantage is divided by
+            ``advantage_norm.scale()`` without re-centering (the advantage is
+            already centred by the value baseline). In training mode, the
+            statistics are updated with the fresh value targets when the loss
+            runs its own value estimator (i.e. when the input tensordict
+            carries no advantage entry), so repeated forwards over the same
+            precomputed rollout do not skew the moving average; rows marked
+            invalid by the validity masks (see
+            :attr:`~torchrl.objectives.LossModule.loss_mask_key`) are excluded
+            from the update. When the advantage is precomputed outside the
+            loss, call ``advantage_norm.update(value_target)`` once per rollout
+            yourself. Mutually exclusive with ``normalize_advantage``.
+            Defaults to ``None``.
         separate_losses (bool, optional): if ``True``, shared parameters between
             policy and critic will only be trained on the policy loss.
             Defaults to ``False``, i.e., gradients are propagated to shared
@@ -199,6 +225,22 @@ class PPOLoss(LossModule):
             The purpose of clipping is to limit the impact of extreme value predictions, helping stabilize training
             and preventing large updates. However, it will have no impact if the value estimate was done by the current
             version of the value estimator. Defaults to ``None``.
+        delay_actor (bool, optional): if ``True``, a detached copy of the actor parameters is kept under
+            ``target_actor_network_params`` and used as the *proximal policy* of the objective, decoupled from
+            the *behavior policy* that collected the data (whose log-probabilities are read from the
+            ``sample_log_prob`` entry). The surrogate stays weighted by the behavior ratio ``pi_theta / pi_behav``
+            (so the gradient estimate remains unbiased for the data at hand) while the proximal policy is used
+            by the trust-region term of the subclasses (clipping in :class:`~torchrl.objectives.ClipPPOLoss`,
+            KL penalty in :class:`~torchrl.objectives.KLPENPPOLoss`) and by the ``kl_approx`` diagnostic.
+            Updating the target parameters with :class:`~torchrl.objectives.SoftUpdate` after every optimizer
+            step makes the proximal policy an exponentially-weighted moving average of the policy, i.e. PPO-EWMA
+            ("Batch size-invariance for policy optimization", Hilton et al., 2021,
+            https://arxiv.org/abs/2110.00641). Requires ``functional=True``. Defaults to ``False``.
+        max_importance_ratio (:obj:`float`, optional): if provided, the behavior ratio ``pi_theta / pi_behav`` is
+            capped at this value. Stale data, or a proximal policy that drifted away from the behavior policy,
+            can otherwise produce arbitrarily large ratios. The cap lifts the (gradient-free) behavior
+            log-probability rather than clamping the ratio, so capped samples keep a rescaled policy gradient,
+            as in the reference PPO-EWMA implementation (which uses ``100.0``). Defaults to ``None`` (no cap).
         device (torch.device, optional): device of the buffers. Defaults to ``None``.
 
             .. note:: Parameters and buffers from the policy / critic will not be cast to that device to ensure that
@@ -451,7 +493,9 @@ class PPOLoss(LossModule):
     default_keys = _AcceptedKeys
     tensor_keys: _AcceptedKeys
     default_value_estimator = ValueEstimators.GAE
-    _schedulable_buffers = frozenset({"entropy_coeff", "critic_coeff", "clip_value"})
+    _schedulable_buffers = frozenset(
+        {"entropy_coeff", "critic_coeff", "clip_value", "max_importance_ratio"}
+    )
 
     actor_network: ProbabilisticTensorDictModule
     critic_network: TensorDictModule
@@ -473,6 +517,7 @@ class PPOLoss(LossModule):
         loss_critic_type: str = "smooth_l1",
         normalize_advantage: bool = False,
         normalize_advantage_exclude_dims: tuple[int] = (),
+        advantage_norm: ValueNorm | None = None,
         gamma: float | None = None,
         separate_losses: bool = False,
         advantage_key: str | None = None,
@@ -483,6 +528,8 @@ class PPOLoss(LossModule):
         critic: ProbabilisticTensorDictSequential = None,
         reduction: str | None = None,
         clip_value: float | None = None,
+        delay_actor: bool = False,
+        max_importance_ratio: float | None = None,
         device: torch.device | None = None,
         **kwargs,
     ):
@@ -518,11 +565,20 @@ class PPOLoss(LossModule):
         self._out_keys = None
         super().__init__()
         if functional:
-            self.convert_to_functional(actor_network, "actor_network")
+            self.convert_to_functional(
+                actor_network, "actor_network", create_target_params=delay_actor
+            )
+        elif delay_actor:
+            raise ValueError(
+                "delay_actor=True requires functional=True: the proximal policy is "
+                "held in target_actor_network_params, which only exists for "
+                "functionalized modules."
+            )
         else:
             self.actor_network = actor_network
             self.actor_network_params = None
             self.target_actor_network_params = None
+        self.delay_actor = delay_actor
 
         if separate_losses:
             # we want to make sure there are no duplicates in the params: the
@@ -576,8 +632,15 @@ class PPOLoss(LossModule):
         self.register_coeff_buffer("critic_coeff", critic_coeff, device=device)
         self._has_critic = bool(self.critic_coeff is not None and self.critic_coeff > 0)
         self.loss_critic_type = loss_critic_type
+        if advantage_norm is not None and normalize_advantage:
+            raise ValueError(
+                "normalize_advantage=True and advantage_norm are mutually "
+                "exclusive: pass either the mean/std standardization flag or "
+                "a ValueNorm instance, not both."
+            )
         self.normalize_advantage = normalize_advantage
         self.normalize_advantage_exclude_dims = normalize_advantage_exclude_dims
+        self.advantage_norm = advantage_norm
 
         if gamma is not None:
             raise TypeError(_GAMMA_LMBDA_DEPREC_ERROR)
@@ -588,6 +651,13 @@ class PPOLoss(LossModule):
         )
 
         self.register_coeff_buffer("clip_value", clip_value, device=device)
+        if max_importance_ratio is not None and max_importance_ratio <= 0:
+            raise ValueError(
+                f"max_importance_ratio must be > 0, got {max_importance_ratio}."
+            )
+        self.register_coeff_buffer(
+            "max_importance_ratio", max_importance_ratio, device=device
+        )
         try:
             log_prob_keys = self.actor_network.log_prob_keys
             action_keys = self.actor_network.dist_sample_keys
@@ -662,56 +732,69 @@ class PPOLoss(LossModule):
     def _get_entropy(
         self, dist: d.Distribution, adv_shape: torch.Size
     ) -> torch.Tensor | TensorDict:
-        try:
-            entropy = (
-                composite_entropy(dist, self.samples_mc_entropy)
-                if isinstance(dist, CompositeDistribution)
-                else dist.entropy()
+        is_composite = isinstance(dist, CompositeDistribution)
+        if is_composite:
+            can_compute_component_entropy = all(
+                has_analytic_entropy(component) or component.has_rsample
+                for component in dist.dists.values()
             )
-            if not entropy.isfinite().all():
-                del entropy
-                if VERBOSE:
-                    torchrl_logger.info(
-                        "Entropy is not finite. Using Monte Carlo sampling."
+            if can_compute_component_entropy:
+                entropy = composite_entropy(dist, self.samples_mc_entropy)
+            else:
+                if not is_dynamo_compiling():
+                    _warn_mc_entropy(dist)
+                with set_composite_lp_aggregate(False):
+                    _, log_prob = sample_and_log_prob(
+                        dist,
+                        (self.samples_mc_entropy,),
+                        reparameterize=getattr(dist, "has_rsample", False),
                     )
-                raise NotImplementedError
-        except NotImplementedError:
-            if VERBOSE:
-                torchrl_logger.warning(
-                    f"Entropy not implemented for {type(dist)} or is not finite. Using Monte Carlo sampling."
-                )
-            with (
-                set_composite_lp_aggregate(False)
-                if isinstance(dist, CompositeDistribution)
-                else contextlib.nullcontext()
-            ):
-                _, log_prob = sample_and_log_prob(
-                    dist,
-                    (self.samples_mc_entropy,),
-                    reparameterize=getattr(dist, "has_rsample", False),
-                )
-                if is_tensor_collection(log_prob):
                     if isinstance(self.tensor_keys.sample_log_prob, NestedKey):
                         log_prob = log_prob.get(self.tensor_keys.sample_log_prob)
                     else:
                         log_prob = log_prob.select(*self.tensor_keys.sample_log_prob)
-
-            entropy = -log_prob.mean(0)
+                entropy = -log_prob.mean(0)
+        else:
+            analytic_entropy = has_analytic_entropy(dist)
+            if analytic_entropy:
+                entropy = dist.entropy()
+            compiling = is_dynamo_compiling()
+            needs_mc = not analytic_entropy or compiling
+            if analytic_entropy and not compiling and not entropy.isfinite().all():
+                needs_mc = True
+            if needs_mc:
+                if not compiling:
+                    _warn_mc_entropy(dist)
+                _, log_prob = sample_and_log_prob(
+                    dist,
+                    (self.samples_mc_entropy,),
+                    reparameterize=dist.has_rsample,
+                )
+                sampled_entropy = -log_prob.mean(0)
+                if analytic_entropy and compiling:
+                    entropy = torch.where(entropy.isfinite(), entropy, sampled_entropy)
+                else:
+                    entropy = sampled_entropy
+        if is_composite:
             if is_tensor_collection(entropy) and entropy.batch_size != adv_shape:
                 entropy.batch_size = adv_shape
         return entropy.unsqueeze(-1)
 
-    def _get_cur_log_prob(self, tensordict):
+    def _get_cur_log_prob(
+        self, tensordict: TensorDictBase, params: TensorDictParams | None = None
+    ):
+        # ``params`` selects the parameter set the actor runs with (the current
+        # parameters by default; the target parameters for the proximal policy).
         if isinstance(
             self.actor_network,
             (ProbabilisticTensorDictSequential, ProbabilisticTensorDictModule),
         ) or hasattr(self.actor_network, "get_dist"):
             # assert tensordict['log_probs'].requires_grad
             # assert tensordict['logits'].requires_grad
+            if params is None:
+                params = self.actor_network_params
             with (
-                self.actor_network_params.to_module(
-                    self.actor_network, preserve_module_state=False
-                )
+                params.to_module(self.actor_network, preserve_module_state=False)
                 if self.functional
                 else contextlib.nullcontext()
             ):
@@ -752,7 +835,16 @@ class PPOLoss(LossModule):
 
     def _log_weight(
         self, tensordict: TensorDictBase, adv_shape: torch.Size
-    ) -> tuple[torch.Tensor, d.Distribution, torch.Tensor]:
+    ) -> tuple[torch.Tensor, d.Distribution, torch.Tensor, torch.Tensor | None]:
+        # Returns
+        #   log_weight: log(pi_theta / pi_prox), the ratio the trust region acts on;
+        #   dist: the current policy distribution;
+        #   kl_approx: log(pi_prox / pi_theta), a diagnostic;
+        #   log_is_weight: log(pi_prox / pi_behav), the gradient-free correction
+        #       that turns log_weight into the behavior ratio
+        #       log(pi_theta / pi_behav) the surrogate must be weighted by.
+        #       ``None`` when the proximal policy is the behavior policy and no
+        #       ratio cap is set, in which case log_weight already is that ratio.
         prev_log_prob = _maybe_get_or_select(
             tensordict,
             self.tensor_keys.sample_log_prob,
@@ -768,6 +860,13 @@ class PPOLoss(LossModule):
             )
 
         log_prob, dist, is_composite = self._get_cur_log_prob(tensordict)
+        if self.delay_actor:
+            with torch.no_grad():
+                prox_log_prob, _, _ = self._get_cur_log_prob(
+                    tensordict, params=self.target_actor_network_params
+                )
+        else:
+            prox_log_prob = prev_log_prob
 
         if is_composite:
             with set_composite_lp_aggregate(False):
@@ -783,18 +882,42 @@ class PPOLoss(LossModule):
                     if is_tensor_collection(log_prob):
                         log_prob = _sum_td_features(log_prob)
                         log_prob.view_as(prev_log_prob)
-                if log_prob.batch_size != adv_shape:
+                    if is_tensor_collection(prox_log_prob):
+                        prox_log_prob = _sum_td_features(prox_log_prob)
+                if is_tensor_collection(log_prob) and log_prob.batch_size != adv_shape:
                     log_prob.batch_size = adv_shape
-        log_weight = (log_prob - prev_log_prob).unsqueeze(-1)
+                if (
+                    is_tensor_collection(prox_log_prob)
+                    and prox_log_prob.batch_size != adv_shape
+                ):
+                    prox_log_prob.batch_size = adv_shape
+        log_weight = (log_prob - prox_log_prob).unsqueeze(-1)
         if is_tensor_collection(log_weight):
             log_weight = _sum_td_features(log_weight)
             log_weight = log_weight.view(adv_shape).unsqueeze(-1)
 
-        kl_approx = (prev_log_prob - log_prob).unsqueeze(-1)
+        kl_approx = (prox_log_prob - log_prob).unsqueeze(-1)
         if is_tensor_collection(kl_approx):
             kl_approx = _sum_td_features(kl_approx)
 
-        return log_weight, dist, kl_approx
+        log_is_weight = None
+        if self.delay_actor:
+            log_is_weight = (prox_log_prob - prev_log_prob).unsqueeze(-1)
+            if is_tensor_collection(log_is_weight):
+                log_is_weight = _sum_td_features(log_is_weight)
+                log_is_weight = log_is_weight.view(adv_shape).unsqueeze(-1)
+        if self.max_importance_ratio is not None:
+            if log_is_weight is None:
+                log_is_weight = torch.zeros_like(log_weight)
+            # Cap pi_theta / pi_behav at max_importance_ratio by lifting the
+            # (gradient-free) behavior log-prob, as the reference PPO-EWMA
+            # implementation does: a capped sample keeps a rescaled policy
+            # gradient instead of the zero gradient a clamp on the ratio gives.
+            log_is_weight = torch.minimum(
+                log_is_weight, self.max_importance_ratio.log() - log_weight.detach()
+            )
+
+        return log_weight, dist, kl_approx, log_is_weight
 
     def _critic_loss_inputs(
         self,
@@ -939,17 +1062,15 @@ class PPOLoss(LossModule):
         )
         return (advantage - loc) / scale
 
-    @dispatch
-    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        tensordict = tensordict.clone(False)
-        advantage = tensordict.get(self.tensor_keys.advantage, None)
-        if advantage is None:
-            self.value_estimator(
-                tensordict,
-                params=self._cached_critic_network_params_detached,
-                target_params=self.target_critic_network_params,
-            )
-            advantage = tensordict.get(self.tensor_keys.advantage)
+    def _maybe_normalize_advantage(
+        self,
+        advantage: torch.Tensor,
+        tensordict: TensorDictBase,
+        *,
+        update_norm: bool,
+    ) -> torch.Tensor:
+        if self.advantage_norm is not None:
+            return self._scale_advantage(advantage, tensordict, update=update_norm)
         if self.normalize_advantage and advantage.numel() > 1:
             if advantage.numel() > tensordict.batch_size.numel() and not len(
                 self.normalize_advantage_exclude_dims
@@ -961,12 +1082,54 @@ class PPOLoss(LossModule):
                     "If you are working in multi-agent/multi-objective settings this is highly suggested."
                 )
             advantage = self._standardize_advantage(advantage, tensordict)
+        return advantage
 
-        log_weight, dist, kl_approx = self._log_weight(
+    def _scale_advantage(
+        self,
+        advantage: torch.Tensor,
+        tensordict: TensorDictBase,
+        *,
+        update: bool,
+    ) -> torch.Tensor:
+        if update and self.training:
+            value_target = tensordict.get(self.tensor_keys.value_target, None)
+            if value_target is None:
+                raise KeyError(
+                    f"advantage_norm requires the value target "
+                    f"({self.tensor_keys.value_target!r}) in the input "
+                    "tensordict to update the return statistics; the value "
+                    "estimator is expected to write it."
+                )
+            value_target = _valid_value_target_rows(
+                value_target, tensordict, self._loss_mask_keys()
+            )
+            self.advantage_norm.update(value_target)
+        return advantage / self.advantage_norm.scale()
+
+    @dispatch
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        tensordict = tensordict.clone(False)
+        advantage = tensordict.get(self.tensor_keys.advantage, None)
+        update_norm = advantage is None
+        if advantage is None:
+            self.value_estimator(
+                tensordict,
+                params=self._cached_critic_network_params_detached,
+                target_params=self.target_critic_network_params,
+            )
+            advantage = tensordict.get(self.tensor_keys.advantage)
+        advantage = self._maybe_normalize_advantage(
+            advantage, tensordict, update_norm=update_norm
+        )
+
+        log_weight, dist, kl_approx, log_is_weight = self._log_weight(
             tensordict, adv_shape=advantage.shape[:-1]
         )
         advantage = _broadcast_advantage_to_log_weight(advantage, log_weight)
         _check_advantage_broadcast(advantage, log_weight)
+        if log_is_weight is not None:
+            # the surrogate is weighted by the behavior ratio pi_theta / pi_behav
+            log_weight = log_weight + log_is_weight
         neg_loss = log_weight.exp() * advantage
         td_out = TensorDict({"loss_objective": -neg_loss})
         td_out.set("kl_approx", kl_approx.detach().mean())  # for logging
@@ -1139,6 +1302,22 @@ class ClipPPOLoss(PPOLoss):
         normalize_advantage_exclude_dims (Tuple[int], optional): dimensions to exclude from the advantage
             standardization. Negative dimensions are valid. This is useful in multiagent (or multiobjective) settings
             where the agent (or objective) dimension may be excluded from the reductions. Default: ().
+        advantage_norm (ValueNorm, optional): a stateful
+            :class:`~torchrl.modules.ValueNorm` used to rescale the advantage,
+            e.g. :class:`~torchrl.modules.PercentileValueNorm` for
+            DreamerV3-style return normalization. The advantage is divided by
+            ``advantage_norm.scale()`` without re-centering (the advantage is
+            already centred by the value baseline). In training mode, the
+            statistics are updated with the fresh value targets when the loss
+            runs its own value estimator (i.e. when the input tensordict
+            carries no advantage entry), so repeated forwards over the same
+            precomputed rollout do not skew the moving average; rows marked
+            invalid by the validity masks (see
+            :attr:`~torchrl.objectives.LossModule.loss_mask_key`) are excluded
+            from the update. When the advantage is precomputed outside the
+            loss, call ``advantage_norm.update(value_target)`` once per rollout
+            yourself. Mutually exclusive with ``normalize_advantage``.
+            Defaults to ``None``.
         separate_losses (bool, optional): if ``True``, shared parameters between
             policy and critic will only be trained on the policy loss.
             Defaults to ``False``, i.e., gradients are propagated to shared
@@ -1168,6 +1347,21 @@ class ClipPPOLoss(PPOLoss):
             ``clip_epsilon`` parameter will be used as the clipping threshold (this is only compatible with a
             scalar ``clip_epsilon``; with an asymmetric ``(low, high)`` tuple, pass an explicit float threshold
             instead). If not provided or ``False``, no clipping will be performed. Defaults to ``False``.
+        delay_actor (bool, optional): if ``True``, a detached copy of the actor parameters is kept under
+            ``target_actor_network_params`` and used as the *proximal policy*: the clipping acts on
+            ``pi_theta / pi_prox`` while the surrogate is re-weighted by ``pi_prox / pi_behav``, where
+            ``pi_behav`` is the *behavior policy* that collected the data (``sample_log_prob`` entry), so the
+            gradient estimate remains unbiased for the data at hand. This decouples the strength of the trust
+            region from how (and how recently) the data was collected. Updating the target parameters with
+            :class:`~torchrl.objectives.SoftUpdate` after every optimizer step makes the proximal policy an
+            exponentially-weighted moving average of the policy, i.e. PPO-EWMA ("Batch size-invariance for
+            policy optimization", Hilton et al., 2021, https://arxiv.org/abs/2110.00641); see the note below.
+            Requires ``functional=True``. Defaults to ``False``.
+        max_importance_ratio (:obj:`float`, optional): if provided, the behavior ratio ``pi_theta / pi_behav`` is
+            capped at this value. Stale data, or a proximal policy that drifted away from the behavior policy,
+            can otherwise produce arbitrarily large ratios. The cap lifts the (gradient-free) behavior
+            log-probability rather than clamping the ratio, so capped samples keep a rescaled policy gradient,
+            as in the reference PPO-EWMA implementation (which uses ``100.0``). Defaults to ``None`` (no cap).
         device (torch.device, optional): device of the buffers. Defaults to ``None``.
 
             .. note:: Parameters and buffers from the policy / critic will not be cast to that device to ensure that
@@ -1214,6 +1408,31 @@ class ClipPPOLoss(PPOLoss):
 
       This will work regardless of whether separate_losses is activated or not.
 
+    .. note::
+      **Decoupled proximal policy (PPO-EWMA).** With ``delay_actor=True`` the loss follows the decoupled
+      clipped objective of Hilton et al. (2021),
+
+          loss = -(pi_prox / pi_behav) * min(r * advantage, clip(r, 1 - eps, 1 + eps) * advantage),
+          r = pi_theta / pi_prox,
+
+      where ``pi_prox`` runs on ``target_actor_network_params``. Any :class:`~torchrl.objectives.TargetNetUpdater`
+      controls how old the proximal policy is: a :class:`~torchrl.objectives.SoftUpdate` stepped after every
+      optimizer step gives the EWMA of the paper (``eps`` being the decay rate ``beta_prox``), a
+      :class:`~torchrl.objectives.HardUpdate` refreshes it every ``value_network_update_interval`` steps.
+      ``clip_fraction`` and ``kl_approx`` then describe ``r``, the ratio the trust region acts on, whereas
+      ``ESS``, ``max_ratio`` and ``mean_ratio`` describe the behavior ratio ``pi_theta / pi_behav`` the data
+      is actually weighted by.
+
+        >>> loss_module = ClipPPOLoss(actor, critic, delay_actor=True, max_importance_ratio=100.0)
+        >>> updater = SoftUpdate(loss_module, eps=0.889)
+        >>> for batch in replay_buffer:
+        ...     losses = loss_module(batch)
+        ...     loss = losses["loss_objective"] + losses["loss_critic"] + losses["loss_entropy"]
+        ...     loss.backward()
+        ...     optimizer.step()
+        ...     optimizer.zero_grad()
+        ...     updater.step()
+
     """
 
     _schedulable_buffers = frozenset(
@@ -1240,10 +1459,13 @@ class ClipPPOLoss(PPOLoss):
         loss_critic_type: str = "smooth_l1",
         normalize_advantage: bool = False,
         normalize_advantage_exclude_dims: tuple[int] = (),
+        advantage_norm: ValueNorm | None = None,
         gamma: float | None = None,
         separate_losses: bool = False,
         reduction: str | None = None,
         clip_value: bool | float | None = None,
+        delay_actor: bool = False,
+        max_importance_ratio: float | None = None,
         device: torch.device | None = None,
         **kwargs,
     ):
@@ -1267,10 +1489,13 @@ class ClipPPOLoss(PPOLoss):
             loss_critic_type=loss_critic_type,
             normalize_advantage=normalize_advantage,
             normalize_advantage_exclude_dims=normalize_advantage_exclude_dims,
+            advantage_norm=advantage_norm,
             gamma=gamma,
             separate_losses=separate_losses,
             reduction=reduction,
             clip_value=clip_value,
+            delay_actor=delay_actor,
+            max_importance_ratio=max_importance_ratio,
             device=device,
             **kwargs,
         )
@@ -1364,6 +1589,7 @@ class ClipPPOLoss(PPOLoss):
         advantage = tensordict.get(
             self.tensor_keys.advantage, None, as_padded_tensor=True
         )
+        update_norm = advantage is None
         if advantage is None:
             if self.critic_network is None:
                 raise RuntimeError(
@@ -1375,36 +1601,37 @@ class ClipPPOLoss(PPOLoss):
                 target_params=self.target_critic_network_params,
             )
             advantage = tensordict.get(self.tensor_keys.advantage)
-        if self.normalize_advantage and advantage.numel() > 1:
-            if advantage.numel() > tensordict.batch_size.numel() and not len(
-                self.normalize_advantage_exclude_dims
-            ):
-                warnings.warn(
-                    "You requested advantage normalization and the advantage key has more dimensions"
-                    " than the tensordict batch. Make sure to pass `normalize_advantage_exclude_dims` "
-                    "if you want to keep any dimension independent while computing normalization statistics. "
-                    "If you are working in multi-agent/multi-objective settings this is highly suggested."
-                )
-            advantage = self._standardize_advantage(advantage, tensordict)
+        advantage = self._maybe_normalize_advantage(
+            advantage, tensordict, update_norm=update_norm
+        )
 
-        log_weight, dist, kl_approx = self._log_weight(
+        log_weight, dist, kl_approx, log_is_weight = self._log_weight(
             tensordict, adv_shape=advantage.shape[:-1]
         )
         advantage = _broadcast_advantage_to_log_weight(advantage, log_weight)
         _check_advantage_broadcast(advantage, log_weight)
+        # log_weight is the ratio the clipping acts on (pi_theta / pi_prox); the
+        # surrogate itself is weighted by the behavior ratio
+        # pi_theta / pi_behav = exp(log_weight + log_is_weight). Both coincide
+        # when the proximal policy is the behavior policy (log_is_weight=None).
+        log_behav_weight = (
+            log_weight if log_is_weight is None else log_weight + log_is_weight
+        )
         # ESS for logging
         with torch.no_grad():
             # In theory, ESS should be computed on particles sampled from the same source. Here we sample according
             # to different, unrelated trajectories, which is not standard. Still, it can give an idea of the weights'
             # dispersion.
-            lw = log_weight.squeeze(-1)
+            lw = log_behav_weight.squeeze(-1)
             ess = (2 * lw.logsumexp(0) - (2 * lw).logsumexp(0)).exp()
             batch = log_weight.shape[0]
 
-        gain1 = log_weight.exp() * advantage
+        gain1 = log_behav_weight.exp() * advantage
 
         log_weight_clip = log_weight.clamp(*self._clip_bounds)
         clip_fraction = (log_weight_clip != log_weight).to(log_weight.dtype).mean()
+        if log_is_weight is not None:
+            log_weight_clip = log_weight_clip + log_is_weight
         ratio = log_weight_clip.exp()
         gain2 = ratio * advantage
 
@@ -1436,7 +1663,7 @@ class ClipPPOLoss(PPOLoss):
 
         td_out.set("ESS", ess / batch)
         with torch.no_grad():
-            ratio = log_weight.exp()
+            ratio = log_behav_weight.exp()
             td_out.set("max_ratio", ratio.max())
             td_out.set("mean_ratio", ratio.mean())
         td_out = td_out.named_apply(
@@ -1500,6 +1727,22 @@ class KLPENPPOLoss(PPOLoss):
         normalize_advantage_exclude_dims (Tuple[int], optional): dimensions to exclude from the advantage
             standardization. Negative dimensions are valid. This is useful in multiagent (or multiobjective) settings
             where the agent (or objective) dimension may be excluded from the reductions. Default: ().
+        advantage_norm (ValueNorm, optional): a stateful
+            :class:`~torchrl.modules.ValueNorm` used to rescale the advantage,
+            e.g. :class:`~torchrl.modules.PercentileValueNorm` for
+            DreamerV3-style return normalization. The advantage is divided by
+            ``advantage_norm.scale()`` without re-centering (the advantage is
+            already centred by the value baseline). In training mode, the
+            statistics are updated with the fresh value targets when the loss
+            runs its own value estimator (i.e. when the input tensordict
+            carries no advantage entry), so repeated forwards over the same
+            precomputed rollout do not skew the moving average; rows marked
+            invalid by the validity masks (see
+            :attr:`~torchrl.objectives.LossModule.loss_mask_key`) are excluded
+            from the update. When the advantage is precomputed outside the
+            loss, call ``advantage_norm.update(value_target)`` once per rollout
+            yourself. Mutually exclusive with ``normalize_advantage``.
+            Defaults to ``None``.
         separate_losses (bool, optional): if ``True``, shared parameters between
             policy and critic will only be trained on the policy loss.
             Defaults to ``False``, i.e., gradients are propagated to shared
@@ -1526,6 +1769,22 @@ class KLPENPPOLoss(PPOLoss):
             The purpose of clipping is to limit the impact of extreme value predictions, helping stabilize training
             and preventing large updates. However, it will have no impact if the value estimate was done by the current
             version of the value estimator. Defaults to ``None``.
+        delay_actor (bool, optional): if ``True``, a detached copy of the actor parameters is kept under
+            ``target_actor_network_params`` and used as the *proximal policy* of the objective, decoupled from
+            the *behavior policy* that collected the data (whose log-probabilities are read from the
+            ``sample_log_prob`` entry). The surrogate stays weighted by the behavior ratio ``pi_theta / pi_behav``
+            (so the gradient estimate remains unbiased for the data at hand) while the proximal policy is used
+            by the trust-region term of the subclasses (clipping in :class:`~torchrl.objectives.ClipPPOLoss`,
+            KL penalty in :class:`~torchrl.objectives.KLPENPPOLoss`) and by the ``kl_approx`` diagnostic.
+            Updating the target parameters with :class:`~torchrl.objectives.SoftUpdate` after every optimizer
+            step makes the proximal policy an exponentially-weighted moving average of the policy, i.e. PPO-EWMA
+            ("Batch size-invariance for policy optimization", Hilton et al., 2021,
+            https://arxiv.org/abs/2110.00641). Requires ``functional=True``. Defaults to ``False``.
+        max_importance_ratio (:obj:`float`, optional): if provided, the behavior ratio ``pi_theta / pi_behav`` is
+            capped at this value. Stale data, or a proximal policy that drifted away from the behavior policy,
+            can otherwise produce arbitrarily large ratios. The cap lifts the (gradient-free) behavior
+            log-probability rather than clamping the ratio, so capped samples keep a rescaled policy gradient,
+            as in the reference PPO-EWMA implementation (which uses ``100.0``). Defaults to ``None`` (no cap).
         device (torch.device, optional): device of the buffers. Defaults to ``None``.
 
             .. note:: Parameters and buffers from the policy / critic will not be cast to that device to ensure that
@@ -1600,10 +1859,13 @@ class KLPENPPOLoss(PPOLoss):
         loss_critic_type: str = "smooth_l1",
         normalize_advantage: bool = False,
         normalize_advantage_exclude_dims: tuple[int] = (),
+        advantage_norm: ValueNorm | None = None,
         gamma: float | None = None,
         separate_losses: bool = False,
         reduction: str | None = None,
         clip_value: float | None = None,
+        delay_actor: bool = False,
+        max_importance_ratio: float | None = None,
         device: torch.device | None = None,
         **kwargs,
     ):
@@ -1617,10 +1879,13 @@ class KLPENPPOLoss(PPOLoss):
             loss_critic_type=loss_critic_type,
             normalize_advantage=normalize_advantage,
             normalize_advantage_exclude_dims=normalize_advantage_exclude_dims,
+            advantage_norm=advantage_norm,
             gamma=gamma,
             separate_losses=separate_losses,
             reduction=reduction,
             clip_value=clip_value,
+            delay_actor=delay_actor,
+            max_importance_ratio=max_importance_ratio,
             device=device,
             **kwargs,
         )
@@ -1699,14 +1964,24 @@ class KLPENPPOLoss(PPOLoss):
     @dispatch
     def forward(self, tensordict: TensorDictBase) -> TensorDict:
         tensordict_copy = tensordict.copy()
-        try:
-            previous_dist = self.actor_network.build_dist_from_params(tensordict)
-        except KeyError as err:
-            raise KeyError(
-                "The parameters of the distribution were not found. "
-                f"Make sure they are provided to {type(self).__name__}."
-            ) from err
+        if self.delay_actor:
+            # the KL penalty pulls the policy towards the proximal policy held
+            # in the target parameters, not towards the behavior policy whose
+            # distribution parameters are stored in the data
+            with torch.no_grad(), self.target_actor_network_params.to_module(
+                self.actor_network, preserve_module_state=False
+            ):
+                previous_dist = self.actor_network.get_dist(tensordict_copy)
+        else:
+            try:
+                previous_dist = self.actor_network.build_dist_from_params(tensordict)
+            except KeyError as err:
+                raise KeyError(
+                    "The parameters of the distribution were not found. "
+                    f"Make sure they are provided to {type(self).__name__}."
+                ) from err
         advantage = tensordict_copy.get(self.tensor_keys.advantage, None)
+        update_norm = advantage is None
         if advantage is None:
             self.value_estimator(
                 tensordict_copy,
@@ -1714,23 +1989,18 @@ class KLPENPPOLoss(PPOLoss):
                 target_params=self.target_critic_network_params,
             )
             advantage = tensordict_copy.get(self.tensor_keys.advantage)
-        if self.normalize_advantage and advantage.numel() > 1:
-            if advantage.numel() > tensordict.batch_size.numel() and not len(
-                self.normalize_advantage_exclude_dims
-            ):
-                warnings.warn(
-                    "You requested advantage normalization and the advantage key has more dimensions"
-                    " than the tensordict batch. Make sure to pass `normalize_advantage_exclude_dims` "
-                    "if you want to keep any dimension independent while computing normalization statistics. "
-                    "If you are working in multi-agent/multi-objective settings this is highly suggested."
-                )
-            advantage = self._standardize_advantage(advantage, tensordict)
+        advantage = self._maybe_normalize_advantage(
+            advantage, tensordict_copy, update_norm=update_norm
+        )
 
-        log_weight, dist, kl_approx = self._log_weight(
+        log_weight, dist, kl_approx, log_is_weight = self._log_weight(
             tensordict_copy, adv_shape=advantage.shape[:-1]
         )
         advantage = _broadcast_advantage_to_log_weight(advantage, log_weight)
         _check_advantage_broadcast(advantage, log_weight)
+        if log_is_weight is not None:
+            # the surrogate is weighted by the behavior ratio pi_theta / pi_behav
+            log_weight = log_weight + log_is_weight
         neg_loss = log_weight.exp() * advantage
 
         with (
@@ -1742,9 +2012,10 @@ class KLPENPPOLoss(PPOLoss):
         ):
             current_dist = self.actor_network.get_dist(tensordict_copy)
         is_composite = isinstance(current_dist, CompositeDistribution)
-        try:
+        if has_analytic_kl(previous_dist, current_dist):
             kl = torch.distributions.kl.kl_divergence(previous_dist, current_dist)
-        except NotImplementedError:
+        else:
+            _warn_mc_kl(previous_dist, current_dist)
             with (
                 set_composite_lp_aggregate(False)
                 if is_composite

@@ -11,6 +11,7 @@ import functools
 import pytest
 import torch
 from packaging import version
+from pyvers import implement_for
 
 from tensordict import assert_allclose_td, TensorDict
 from tensordict.nn import (
@@ -57,8 +58,37 @@ from torchrl.testing import (  # noqa
 
 _TORCH_VERSION = version.parse(version.parse(torch.__version__).base_version)
 
+_VALUE_CHUNK_KWARGS = [
+    {"value_chunk_size": 3},
+    {"num_chunks": 3},
+    {"num_chunk": 3},
+    {"value_chunk_size": 3, "value_chunk_dim": 1},
+    {"num_chunks": 3, "value_chunk_dim": 1},
+]
+
 
 class TestValues:
+    @implement_for("torch", None, "2.7", compilable=True)
+    @pytest.mark.parametrize(
+        "estimator_cls,kwargs",
+        [
+            (TD0Estimator, {"gamma": 0.9}),
+            (TD1Estimator, {"gamma": 0.9}),
+            (TDLambdaEstimator, {"gamma": 0.9, "lmbda": 0.95}),
+            (GAE, {"gamma": 0.9, "lmbda": 0.95}),
+        ],
+    )
+    @pytest.mark.parametrize("shifted", [False, True])
+    @pytest.mark.parametrize("deactivate_vmap", [False])
+    @pytest.mark.parametrize("chunk_kwargs", _VALUE_CHUNK_KWARGS)
+    def test_chunked_value_calls_match_unchunked(
+        self, estimator_cls, kwargs, shifted, deactivate_vmap, chunk_kwargs
+    ):
+        self._test_chunked_value_calls_match_unchunked(
+            estimator_cls, kwargs, shifted, deactivate_vmap, chunk_kwargs
+        )
+
+    @implement_for("torch", "2.7", compilable=True)
     @pytest.mark.parametrize(
         "estimator_cls,kwargs",
         [
@@ -70,21 +100,17 @@ class TestValues:
     )
     @pytest.mark.parametrize("shifted", [False, True])
     @pytest.mark.parametrize("deactivate_vmap", [False, True])
-    @pytest.mark.parametrize(
-        "chunk_kwargs",
-        [
-            {"value_chunk_size": 3},
-            {"num_chunks": 3},
-            {"num_chunk": 3},
-            {"value_chunk_size": 3, "value_chunk_dim": 1},
-            {"num_chunks": 3, "value_chunk_dim": 1},
-        ],
-    )
-    def test_chunked_value_calls_match_unchunked(
+    @pytest.mark.parametrize("chunk_kwargs", _VALUE_CHUNK_KWARGS)
+    def test_chunked_value_calls_match_unchunked(  # noqa: F811
         self, estimator_cls, kwargs, shifted, deactivate_vmap, chunk_kwargs
     ):
-        if deactivate_vmap and _TORCH_VERSION < version.parse("2.7"):
-            pytest.skip("_pseudo_vmap is not supported for torch<2.7")
+        self._test_chunked_value_calls_match_unchunked(
+            estimator_cls, kwargs, shifted, deactivate_vmap, chunk_kwargs
+        )
+
+    def _test_chunked_value_calls_match_unchunked(
+        self, estimator_cls, kwargs, shifted, deactivate_vmap, chunk_kwargs
+    ):
         torch.manual_seed(0)
         value_net = TensorDictModule(
             nn.Linear(3, 1),
@@ -196,24 +222,33 @@ class TestValues:
         with pytest.raises(ValueError, match="value_chunk_dim"):
             bad_estimator._split_value_net_input(td)
 
+    @implement_for("torch", None, "2.7", compilable=True)
     @pytest.mark.parametrize("vectorized", [False, True])
-    @pytest.mark.parametrize("deactivate_vmap", [False, True])
+    @pytest.mark.parametrize("deactivate_vmap", [False])
     @pytest.mark.parametrize("method", ["forward", "value_estimate"])
-    @pytest.mark.parametrize(
-        "chunk_kwargs",
-        [
-            {"value_chunk_size": 3},
-            {"num_chunks": 3},
-            {"num_chunk": 3},
-            {"value_chunk_size": 3, "value_chunk_dim": 1},
-            {"num_chunks": 3, "value_chunk_dim": 1},
-        ],
-    )
+    @pytest.mark.parametrize("chunk_kwargs", _VALUE_CHUNK_KWARGS)
     def test_gae_chunked_functional_calls_match_unchunked(
         self, vectorized, deactivate_vmap, method, chunk_kwargs
     ):
-        if deactivate_vmap and _TORCH_VERSION < version.parse("2.7"):
-            pytest.skip("_pseudo_vmap is not supported for torch<2.7")
+        self._test_gae_chunked_functional_calls_match_unchunked(
+            vectorized, deactivate_vmap, method, chunk_kwargs
+        )
+
+    @implement_for("torch", "2.7", compilable=True)
+    @pytest.mark.parametrize("vectorized", [False, True])
+    @pytest.mark.parametrize("deactivate_vmap", [False, True])
+    @pytest.mark.parametrize("method", ["forward", "value_estimate"])
+    @pytest.mark.parametrize("chunk_kwargs", _VALUE_CHUNK_KWARGS)
+    def test_gae_chunked_functional_calls_match_unchunked(  # noqa: F811
+        self, vectorized, deactivate_vmap, method, chunk_kwargs
+    ):
+        self._test_gae_chunked_functional_calls_match_unchunked(
+            vectorized, deactivate_vmap, method, chunk_kwargs
+        )
+
+    def _test_gae_chunked_functional_calls_match_unchunked(
+        self, vectorized, deactivate_vmap, method, chunk_kwargs
+    ):
         torch.manual_seed(0)
         value_net = TensorDictModule(
             nn.Linear(3, 1),
@@ -963,6 +998,106 @@ class TestValues:
             torch.zeros((), dtype=out["advantage"].dtype),
         )
 
+    def test_gae_group_key_standardizes_within_groups(self):
+        torch.manual_seed(0)
+        B, T, obs_dim = 4, 5, 3
+        task = torch.tensor([0, 1, 1, 0]).view(B, 1, 1).expand(B, T, 1)
+        # Task 1 earns rewards ten times larger, so its advantages dominate a
+        # global standardization.
+        reward = torch.randn(B, T, 1) * torch.where(task == 1, 10.0, 1.0)
+        td = TensorDict(
+            {
+                "observation": torch.randn(B, T, obs_dim),
+                "metadata": TensorDict({"task_id": task.clone()}, [B, T]),
+                "next": TensorDict(
+                    {
+                        "observation": torch.randn(B, T, obs_dim),
+                        "reward": reward,
+                        "done": torch.zeros(B, T, 1, dtype=torch.bool),
+                        "terminated": torch.zeros(B, T, 1, dtype=torch.bool),
+                    },
+                    [B, T],
+                ),
+            },
+            [B, T],
+        )
+        value_net = TensorDictModule(
+            nn.Linear(obs_dim, 1), in_keys=["observation"], out_keys=["state_value"]
+        )
+        kwargs = {"gamma": 0.9, "lmbda": 0.95, "value_network": value_net}
+        group_key = ("metadata", "task_id")
+        grouped_module = GAE(**kwargs, average_gae=True, group_key=group_key)
+        assert group_key in grouped_module.in_keys
+        grouped = grouped_module(td.clone())
+        for group in (0, 1):
+            adv = grouped["advantage"][task == group]
+            torch.testing.assert_close(adv.mean(), torch.zeros(()), atol=1e-5, rtol=0)
+            torch.testing.assert_close(adv.std(), torch.ones(()), atol=1e-3, rtol=0)
+        # Global standardization leaves the two groups at different scales.
+        global_adv = GAE(**kwargs, average_gae=True)(td.clone())["advantage"]
+        assert global_adv[task == 0].std() < 0.5 < global_adv[task == 1].std()
+        # A single group matches the global standardization.
+        td[group_key].fill_(3)
+        torch.testing.assert_close(
+            GAE(**kwargs, average_gae=True, group_key=group_key)(td.clone())[
+                "advantage"
+            ],
+            global_adv,
+        )
+        with pytest.raises(KeyError, match="group_key"):
+            GAE(
+                **kwargs,
+                average_gae=True,
+                group_key=("metadata", "missing"),
+            )(td.clone())
+
+    @pytest.mark.parametrize(
+        "estimator_cls,estimator_kwargs",
+        [
+            (TD0Estimator, {}),
+            (TD1Estimator, {}),
+            (TDLambdaEstimator, {"lmbda": 0.95}),
+        ],
+    )
+    def test_td_group_key_standardizes_rewards_within_groups(
+        self, estimator_cls, estimator_kwargs
+    ):
+        torch.manual_seed(0)
+        B, T, obs_dim = 4, 5, 3
+        task = torch.tensor([0, 0, 1, 1]).view(B, 1, 1).expand(B, T, 1)
+        reward = torch.where(task == 1, 100.0, 0.0) + torch.randn(B, T, 1)
+        td = TensorDict(
+            {
+                "observation": torch.randn(B, T, obs_dim),
+                "task_id": task.clone(),
+                "next": TensorDict(
+                    {
+                        "observation": torch.randn(B, T, obs_dim),
+                        "reward": reward,
+                        "done": torch.zeros(B, T, 1, dtype=torch.bool),
+                        "terminated": torch.zeros(B, T, 1, dtype=torch.bool),
+                    },
+                    [B, T],
+                ),
+            },
+            [B, T],
+        )
+        value_net = TensorDictModule(
+            nn.Linear(obs_dim, 1), in_keys=["observation"], out_keys=["state_value"]
+        )
+        out = estimator_cls(
+            gamma=0.9,
+            value_network=value_net,
+            average_rewards=True,
+            group_key="task_id",
+            **estimator_kwargs,
+        )(td)
+        standardized = out["next", "reward"]
+        for group in (0, 1):
+            torch.testing.assert_close(
+                standardized[task == group].mean(), torch.zeros(()), atol=1e-5, rtol=0
+            )
+
     def test_shifted_valid_masks_loss_reduction(self):
         loss = LossModule()
         loss.reduction = "mean"
@@ -1545,7 +1680,8 @@ class TestValues:
         "gamma_tensor", ["scalar", "tensor", "tensor_single_element"]
     )
     @pytest.mark.parametrize(
-        "lmbda_tensor", ["scalar", "tensor", "tensor_single_element"]
+        "lmbda_tensor",
+        ["scalar", "tensor", "tensor_zero_dim", "tensor_single_element"],
     )
     def test_gae_param_as_tensor(
         self, device, N, dtype, has_done, gamma_tensor, lmbda_tensor
@@ -1574,7 +1710,9 @@ class TestValues:
 
         if lmbda_tensor == "tensor":
             lmbda_vec = torch.full_like(reward, lmbda)
-        elif gamma_tensor == "tensor_single_element":
+        elif lmbda_tensor == "tensor_zero_dim":
+            lmbda_vec = torch.as_tensor(lmbda, device=device)
+        elif lmbda_tensor == "tensor_single_element":
             lmbda_vec = torch.as_tensor([lmbda], device=device)
         else:
             lmbda_vec = lmbda
@@ -1820,6 +1958,27 @@ class TestValues:
         torch.testing.assert_close(r1, r2, rtol=1e-4, atol=1e-4)
 
     @pytest.mark.parametrize("device", get_default_devices())
+    def test_vtrace_truncated_uses_next_value(self, device):
+        done = torch.tensor([[False], [True], [False], [False]], device=device)
+        terminated = torch.zeros_like(done)
+        reward = torch.zeros(4, 1, device=device)
+        state_value = torch.tensor([[1.0], [1.0], [100.0], [100.0]], device=device)
+        next_state_value = state_value.clone()
+        log_pi = log_mu = torch.zeros_like(state_value)
+
+        advantage, _ = vtrace_advantage_estimate(
+            1.0,
+            log_pi,
+            log_mu,
+            state_value,
+            next_state_value,
+            reward,
+            done=done,
+            terminated=terminated,
+        )
+        torch.testing.assert_close(advantage, torch.zeros_like(advantage))
+
+    @pytest.mark.parametrize("device", get_default_devices())
     @pytest.mark.parametrize("gamma", [0.5, 0.99, 0.1])
     @pytest.mark.parametrize("lmbda", [0.1, 0.5, 0.99])
     @pytest.mark.parametrize("N", [(3,), (7, 3)])
@@ -1899,7 +2058,9 @@ class TestValues:
     @pytest.mark.parametrize(
         "gamma_tensor", ["scalar", "tensor", "tensor_single_element"]
     )
-    @pytest.mark.parametrize("lmbda_tensor", ["scalar", "tensor_single_element"])
+    @pytest.mark.parametrize(
+        "lmbda_tensor", ["scalar", "tensor_zero_dim", "tensor_single_element"]
+    )
     def test_tdlambda_tensor_gamma_single_element(
         self, device, gamma, lmbda, N, T, F, has_done, gamma_tensor, lmbda_tensor
     ):
@@ -1925,7 +2086,9 @@ class TestValues:
         else:
             gamma_vec = gamma
 
-        if gamma_tensor == "tensor_single_element":
+        if lmbda_tensor == "tensor_zero_dim":
+            lmbda_vec = torch.as_tensor(lmbda, device=device)
+        elif lmbda_tensor == "tensor_single_element":
             lmbda_vec = torch.as_tensor([lmbda], device=device)
         else:
             lmbda_vec = lmbda
@@ -2786,6 +2949,52 @@ class TestAdv:
         advantage, value_target = module(**kwargs)
         assert advantage.shape == torch.Size([1, 10, 1])
         assert value_target.shape == torch.Size([1, 10, 1])
+
+    def test_vtrace_group_key_standardizes_within_groups(self):
+        torch.manual_seed(0)
+        B, T, obs_dim = 4, 5, 3
+        task = torch.tensor([0, 0, 1, 1]).view(B, 1, 1).expand(B, T, 1)
+        value_net = TensorDictModule(
+            nn.Linear(obs_dim, 1), in_keys=["obs"], out_keys=["state_value"]
+        )
+        actor_net = ProbabilisticActor(
+            module=TensorDictModule(
+                nn.Linear(obs_dim, 4), in_keys=["obs"], out_keys=["logits"]
+            ),
+            in_keys=["logits"],
+            out_keys=["action"],
+            distribution_class=OneHotCategorical,
+            return_log_prob=True,
+        )
+        td = TensorDict(
+            {
+                "obs": torch.randn(B, T, obs_dim),
+                "task_id": task,
+                "action_log_prob": torch.randn(B, T, 1),
+                "next": {
+                    "obs": torch.randn(B, T, obs_dim),
+                    "reward": torch.randn(B, T, 1),
+                    "done": torch.zeros(B, T, 1, dtype=torch.bool),
+                    "terminated": torch.zeros(B, T, 1, dtype=torch.bool),
+                },
+            },
+            [B, T],
+        )
+        out = VTrace(
+            gamma=0.98,
+            actor_network=actor_net,
+            value_network=value_net,
+            average_adv=True,
+            group_key="task_id",
+        )(td)
+        for group in (0, 1):
+            advantage = out["advantage"][task == group]
+            torch.testing.assert_close(
+                advantage.mean(), torch.zeros(()), atol=1e-5, rtol=0
+            )
+            torch.testing.assert_close(
+                advantage.std(), torch.ones(()), atol=1e-5, rtol=0
+            )
 
     @pytest.mark.parametrize(
         "adv,kwargs",

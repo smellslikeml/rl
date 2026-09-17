@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -21,6 +22,8 @@ def _receive_batch(
     min_get: int,
     max_get: int | None,
     timeout: float | None,
+    *,
+    check_worker_errors: Callable[[], None] | None = None,
 ) -> list[Any]:
     if min_get < 1:
         raise ValueError(f"min_get must be positive, got {min_get}.")
@@ -32,23 +35,62 @@ def _receive_batch(
     if timeout is not None and timeout < 0:
         raise ValueError(f"timeout must be non-negative, got {timeout}.")
 
-    items = [result_queue.get()]
+    # The deadline is anchored at call entry and bounds the entire call,
+    # including the wait for the first result.
     deadline_timer = (
         None if timeout is None else timeit("async_env_batch_deadline").start()
     )
 
+    items: list[Any] = []
     while len(items) < min_get:
-        items.append(result_queue.get())
+        if check_worker_errors is not None:
+            check_worker_errors()
+        if deadline_timer is None and check_worker_errors is None:
+            items.append(result_queue.get())
+            continue
+        remaining = (
+            timeout - deadline_timer.elapsed() if deadline_timer is not None else 0.1
+        )
+        try:
+            if remaining <= 0:
+                # Deadline passed: drain what is already available without
+                # waiting before giving up.
+                items.append(result_queue.get_nowait())
+            else:
+                items.append(
+                    result_queue.get(
+                        timeout=min(remaining, 0.1)
+                        if check_worker_errors is not None
+                        else remaining
+                    )
+                )
+        except queue.Empty:
+            if check_worker_errors is not None:
+                check_worker_errors()
+                if deadline_timer is None or deadline_timer.elapsed() < timeout:
+                    continue
+            # Requeue the partial harvest so no result is lost, then signal
+            # the missed deadline. The pool's pending-result accounting is
+            # only updated by the caller on success, so state stays
+            # consistent.
+            for item in items:
+                result_queue.put(item)
+            raise TimeoutError(
+                f"async recv timed out: {len(items)}/{min_get} results after "
+                f"{timeout}s; partial results were requeued and remain "
+                f"available to the next call."
+            ) from None
 
     limit = max_get if max_get is not None else float("inf")
     while len(items) < limit:
         try:
             if deadline_timer is None:
                 items.append(result_queue.get_nowait())
+                continue
+            remaining = timeout - deadline_timer.elapsed()
+            if remaining <= 0:
+                items.append(result_queue.get_nowait())
             else:
-                remaining = timeout - deadline_timer.elapsed()
-                if remaining <= 0:
-                    break
                 items.append(result_queue.get(timeout=remaining))
         except queue.Empty:
             break
@@ -98,6 +140,16 @@ class _SharedSlotExchange:
                     "Shared slot exchange requires identical TensorDict keys across "
                     f"workers; worker {index} differs from worker 0."
                 )
+            # Leaves-only iteration silently skips non-tensor entries, so walk
+            # every key explicitly: a NonTensorData leaf must reject the
+            # exchange rather than end up in a shared slot.
+            for key in tensordict.keys(True):
+                value = tensordict.get(key)
+                if isinstance(value, (NonTensorData, NonTensorStack)):
+                    raise TypeError(
+                        "Shared slot exchange only supports tensor leaves, "
+                        f"got {type(value).__name__} at key {key!r}."
+                    )
             for key, value in tensordict.items(True, True):
                 if not isinstance(value, torch.Tensor):
                     raise TypeError(
@@ -119,12 +171,13 @@ class _SharedSlotExchange:
                     )
 
     def worker_slots(
-        self, env_index: int
+        self, start: int, stop: int
     ) -> tuple[TensorDictBase, TensorDictBase, TensorDictBase, timeit]:
+        """Return one contiguous shared-memory slice for a worker process."""
         return (
-            self.input_slots[env_index],
-            self.result_slots[env_index],
-            self.next_slots[env_index],
+            self.input_buffer[start:stop],
+            self.result_buffer[start:stop],
+            self.next_buffer[start:stop],
             self._clock,
         )
 
@@ -145,9 +198,11 @@ class _SharedSlotExchange:
             else:
                 tensor_keys.append(key)
         if unsupported:
+            expected_keys = sorted(self._input_keys, key=repr)
             raise KeyError(
-                "Shared slot exchange received keys absent from the fixed exchange "
-                f"schema: {unsupported}. Use exchange='queue' for dynamic data."
+                f"Shared slot exchange received unsupported input at keys {unsupported}. "
+                f"The fixed exchange schema expects tensor keys {expected_keys}. "
+                "Use exchange='queue' for dynamic data."
             )
         self.input_slots[env_index].update_(
             tensordict.select(*tensor_keys, strict=True)
@@ -186,13 +241,28 @@ class _SharedSlotExchange:
         timeout: float | None,
         *,
         track_action: bool,
+        check_worker_errors: Callable[[], None] | None = None,
     ) -> list[tuple]:
-        descriptors = _receive_batch(result_queue, min_get, max_get, timeout)
+        descriptors = _receive_batch(
+            result_queue,
+            min_get,
+            max_get,
+            timeout,
+            check_worker_errors=check_worker_errors,
+        )
         self._record_received(descriptors, max_get=max_get, track_action=track_action)
         return sorted(descriptors, key=lambda descriptor: descriptor[0])
 
-    def receive_one(self, result_queue, *, track_action: bool) -> tuple:
-        descriptor = result_queue.get()
+    def receive_one(
+        self,
+        result_queue,
+        *,
+        track_action: bool,
+        check_worker_errors: Callable[[], None] | None = None,
+    ) -> tuple:
+        descriptor = _receive_batch(
+            result_queue, 1, 1, None, check_worker_errors=check_worker_errors
+        )[0]
         self._record_received([descriptor], max_get=1, track_action=track_action)
         return descriptor
 
@@ -241,7 +311,7 @@ class _SharedSlotExchange:
             self.result_slots[env_index]
             .select(*keys, strict=True)
             .clone()
-            .set("env_index", NonTensorData(env_index))
+            .set("env_index", NonTensorData(data=env_index))
         )
 
     def read_pair(
@@ -269,7 +339,7 @@ class _SharedSlotExchange:
 
     def read_pair_one(self, descriptor: tuple) -> tuple[TensorDictBase, TensorDictBase]:
         env_index, result_keys, next_keys, _ = descriptor
-        index_data = NonTensorData(env_index)
+        index_data = NonTensorData(data=env_index)
         result = (
             self.result_slots[env_index]
             .select(*result_keys, strict=True)

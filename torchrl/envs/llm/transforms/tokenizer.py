@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from typing import Any, TYPE_CHECKING
 
 import torch
-from tensordict import NonTensorData, NonTensorStack, TensorDictBase
+from tensordict import NonTensorData, NonTensorStack, TensorDictBase, unravel_key
 from tensordict.nn import dispatch
 from tensordict.utils import _zip_strict, NestedKey
 from torch import Tensor
@@ -95,15 +96,27 @@ class Tokenizer(UnaryTransform):
         self._missing_tolerance = missing_tolerance
 
     @property
-    def device(self):
-        if "_device" in self.__dict__:
-            return self._device
+    def out_device(self) -> torch.device | None:
+        """Destination for token tensors and attention masks, read from the parent.
+
+        If there is no parent or its device is ``None``, tokenization outputs
+        retain the device chosen by the tokenizer.
+        """
         parent = self.parent
         if parent is None:
             return None
-        device = parent.device
-        self._device = device
-        return device
+        return parent.device
+
+    @property
+    def device(self) -> torch.device | None:
+        """Deprecated alias for :attr:`out_device`, removed in TorchRL v0.17."""
+        warnings.warn(
+            "Tokenizer.device is deprecated and will be removed in TorchRL v0.17. "
+            "Use out_device instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.out_device
 
     def _call(self, next_tensordict: TensorDictBase) -> TensorDictBase:
         # Specialized for attention mask
@@ -168,16 +181,22 @@ class Tokenizer(UnaryTransform):
         return super()._reset(tensordict, tensordict_reset)
 
     def call_tokenizer_fn(self, value: str | list[str]):
-        device = self.device
+        device = self.out_device
         kwargs = {"add_special_tokens": self.add_special_tokens}
         if self.max_length is not None:
             kwargs["padding"] = "max_length"
             kwargs["max_length"] = self.max_length
         if isinstance(value, str):
-            out = self.tokenizer.encode(value, return_tensors="pt", **kwargs)[0]
-            # TODO: incorporate attention mask
             if self.return_attention_mask:
-                attention_mask = torch.ones_like(out, dtype=torch.int64)
+                # Use the same tokenizer call as the batch path so pad tokens
+                # are not attended. Squeeze the batch dim to keep the public
+                # 1D rank of encode()[0].
+                kwargs["return_attention_mask"] = True
+                out = self.tokenizer(value, return_tensors="pt", **kwargs)
+                attention_mask = out["attention_mask"][0]
+                out = out["input_ids"][0]
+            else:
+                out = self.tokenizer.encode(value, return_tensors="pt", **kwargs)[0]
         else:
             kwargs["padding"] = (
                 self.padding if self.max_length is None else "max_length"
@@ -485,11 +504,15 @@ class IncrementalTokenizer(Transform):
         """
         # Try to reuse tokens.full from the action tensordict
         # Since next.history.prompt = history.full, tokens.full is already the correct tokenization
-        tokens_full_key = (
-            (self.tokens_key[0], "full")
-            if isinstance(self.tokens_key, tuple)
-            else "tokens_full"
-        )
+        # Replace the last NestedKey component with "full":
+        #   "tokens" -> ("tokens", "full")
+        #   ("tokens",) -> ("tokens", "full")
+        #   ("obs", "tok", "prompt") -> ("obs", "tok", "full")
+        tokens_key = unravel_key(self.tokens_key)
+        if isinstance(tokens_key, str):
+            tokens_full_key = (tokens_key, "full")
+        else:
+            tokens_full_key = (*tokens_key[:-1], "full")
         existing_tokens_full = tensordict.get(tokens_full_key, None)
 
         if existing_tokens_full is not None:

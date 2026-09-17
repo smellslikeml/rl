@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import warnings
 
 from copy import copy
 from functools import partial
@@ -280,7 +281,7 @@ class TestTransformedEnv:
         assert specs == specs_after
 
     @pytest.mark.filterwarnings("error")
-    def test_nested_transformed_env(self):
+    def test_nested_transformed_env(self, monkeypatch):
         base_env = ContinuousActionVecMockEnv()
         t1 = RewardScaling(0, 1)
         t2 = RewardScaling(0, 2)
@@ -302,8 +303,20 @@ class TestTransformedEnv:
             assert isinstance(env.base_env.transform, RewardScaling)
             assert isinstance(env.transform, RewardScaling)
 
-        with pytest.warns(FutureWarning):
+        monkeypatch.setattr(
+            "torchrl.envs.transforms._base._AUTO_UNWRAP_WARNING_EMITTED", False
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             test_unwrap()
+            test_unwrap()
+        unwrap_warnings = [
+            warning
+            for warning in caught
+            if warning.category is UserWarning
+            and "automatically unwrapped" in str(warning.message)
+        ]
+        assert len(unwrap_warnings) == 1
 
         test_wrap(False)
 
@@ -312,6 +325,26 @@ class TestTransformedEnv:
 
         with set_auto_unwrap_transformed_env(False):
             test_wrap()
+
+    def test_nested_transformed_env_without_transform(self):
+        # Wrapping a transformed env without a transform used to fail in the
+        # unwrap path, which checked the type of None before its None guard.
+        base_env = ContinuousActionVecMockEnv()
+        t1 = RewardScaling(0, 1)
+        with set_auto_unwrap_transformed_env(True):
+            env = TransformedEnv(TransformedEnv(base_env, t1))
+            assert env.base_env is base_env
+            assert isinstance(env.transform, Compose)
+            children = list(env.transform.transforms.children())
+            assert len(children) == 1
+            assert children[0].scale == 1
+        with set_auto_unwrap_transformed_env(False):
+            env = TransformedEnv(TransformedEnv(base_env, t1))
+            assert env.base_env is not base_env
+            assert isinstance(env.base_env.transform, RewardScaling)
+            assert isinstance(env.transform, Compose)
+            assert len(list(env.transform.transforms.children())) == 0
+        env.rollout(2)
 
     def test_auto_unwrap_env_var_restored_on_exit(self, monkeypatch):
         # Regression test: exiting set_auto_unwrap_transformed_env when the
@@ -1426,6 +1459,28 @@ class TestTensorDictPrimer(TransformBase):
         check_env_specs(env)
         assert "mykey" in env.reset().keys()
         assert ("next", "mykey") in env.rollout(3).keys(True)
+
+    def test_spec_dtype_respected(self):
+        """The float default fill must not promote int/bool specs to float32."""
+        env = TransformedEnv(
+            ContinuousActionVecMockEnv(),
+            TensorDictPrimer(
+                intkey=Unbounded([1], dtype=torch.long),
+                boolkey=Unbounded([1], dtype=torch.bool),
+            ),
+        )
+        check_env_specs(env)
+        reset = env.reset()
+        assert reset["intkey"].dtype is torch.long
+        assert reset["boolkey"].dtype is torch.bool
+        rollout = env.rollout(3)
+        assert rollout[("next", "intkey")].dtype is torch.long
+        assert rollout[("next", "boolkey")].dtype is torch.bool
+
+        t = TensorDictPrimer(intkey=Unbounded([1], dtype=torch.long))
+        td = TensorDict({"a": torch.zeros(())}, [])
+        t(td)
+        assert td["intkey"].dtype is torch.long
 
     def test_nested_key_env(self):
         env = MultiKeyCountingEnv()

@@ -10,14 +10,18 @@ import multiprocessing as mp
 import os
 import os.path
 import pathlib
+import runpy
+import sys
 import tempfile
 import threading
 from time import sleep
+from unittest import mock
 
 import pytest
 import torch
-from tensordict import MemoryMappedTensor
 
+import torchrl.record.loggers.wandb as wandb_logger_module
+from tensordict import MemoryMappedTensor
 from torchrl._comm import MailboxPeerClosedError
 from torchrl.checkpoint import Checkpoint
 from torchrl.data import LazyTensorStorage, ReplayBuffer
@@ -35,6 +39,8 @@ from torchrl.record.loggers.wandb import _has_moviepy, _has_wandb, WandbLogger
 from torchrl.record.recorder import PixelRenderTransform, VideoRecorder
 
 _has_mp4 = _has_torchcodec
+_has_hydra = importlib.util.find_spec("hydra") is not None
+_has_omegaconf = importlib.util.find_spec("omegaconf") is not None
 
 if _has_tb:
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -213,6 +219,58 @@ class TestCSVLogger:
         assert restored.experiment.scalars["reward"] == [(0, 2.0)]
         assert restored.experiment.videos_counter["evaluation"] == 3
 
+    def test_text_and_video_steps_are_counted_separately(self, tmp_path):
+        logger = CSVLogger(log_dir=tmp_path, exp_name="counters")
+        video = torch.zeros(1, 2, 3, 4, 4, dtype=torch.uint8)
+        logger.log_video("demo", video)
+        logger.log_video("demo", video)
+        logger.experiment.add_text("demo", "note")
+        logger.log_hparams({"lr": 0.1})
+        exp_dir = tmp_path / "counters"
+        assert sorted(os.listdir(exp_dir / "videos")) == ["demo_0.pt", "demo_1.pt"]
+        assert sorted(os.listdir(exp_dir / "texts")) == ["demo0.txt", "hparams0.txt"]
+
+        # a resumed logger keeps numbering the texts after the saved ones
+        resumed = CSVLogger(log_dir=tmp_path, exp_name="counters")
+        resumed.load_state_dict(logger.state_dict())
+        resumed.log_hparams({"lr": 0.2})
+        assert (exp_dir / "texts" / "hparams0.txt").read_text() == "lr: 0.1"
+        assert (exp_dir / "texts" / "hparams1.txt").read_text() == "lr: 0.2"
+
+    def test_resume_checkpoint_saved_without_text_counter(self, tmp_path):
+        logger = get_logger("csv", str(tmp_path), "legacy")
+        logger.log_hparams({"lr": 0.1})
+        state = logger.state_dict()
+        logger.close()
+        # checkpoints saved before texts had their own counter kept the text
+        # steps in videos_counter
+        state["local"]["videos_counter"] = state["local"]["text_counter"]
+        state["local"]["text_counter"] = {}
+        resumed = get_logger(
+            "csv", str(tmp_path / "unused"), "unused", state_dict=state
+        )
+        resumed.log_hparams({"lr": 0.2})
+        resumed.close()
+        texts = tmp_path / "legacy" / "texts"
+        assert (texts / "hparams0.txt").read_text() == "lr: 0.1"
+        assert (texts / "hparams1.txt").read_text() == "lr: 0.2"
+
+    def test_factory_resume_appends_same_run(self, tmp_path):
+        logger = get_logger("csv", str(tmp_path), "saved")
+        logger.log_scalar("reward", 1.0)
+        state = logger.state_dict()
+        logger.close()
+        resumed = get_logger(
+            "csv", str(tmp_path / "unused"), "unused", state_dict=state
+        )
+        resumed.log_scalar("reward", 2.0)
+        resumed.close()
+        assert (tmp_path / "saved/scalars/reward.csv").read_text().splitlines() == [
+            "0,1.0",
+            "1,2.0",
+        ]
+        assert not (tmp_path / "unused").exists()
+
     def test_direct_service_client_is_identity(self, tmpdir):
         logger = CSVLogger(log_dir=tmpdir, exp_name="direct")
         assert logger.client() is logger
@@ -364,6 +422,108 @@ def wandb_tmp_logger(tmp_path):
     logger.experiment.finish()
     wandb.finish()
     del logger
+
+
+@pytest.mark.parametrize("source", ["logger", "dreamer_v3"])
+def test_wandb_base_url_used_for_login_and_init(monkeypatch, source):
+    calls = []
+    initializations = []
+
+    class Settings:
+        def __init__(self, *, base_url):
+            self.base_url = base_url
+
+    def login(*, host, key=None):
+        del key
+        calls.append(("login", host))
+
+    def init(**kwargs):
+        calls.append(("init", kwargs["settings"].base_url))
+        initializations.append(kwargs)
+        return argparse.Namespace(
+            config={}, define_metric=mock.Mock(), id="generated-run", log=mock.Mock()
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "wandb",
+        argparse.Namespace(Settings=Settings, init=init, login=login),
+    )
+    monkeypatch.setattr(wandb_logger_module, "_has_wandb", True)
+    base_url = "https://wandb.example.com"
+
+    if source == "logger":
+        logger = WandbLogger(exp_name="test", base_url=base_url, log_env_packages=False)
+        state = logger.state_dict()
+        resumed = get_logger(
+            "wandb",
+            "ignored",
+            "ignored",
+            state_dict=state,
+            wandb_kwargs={"base_url": base_url, "log_env_packages": False},
+        )
+        assert initializations[-1]["id"] == "generated-run"
+        assert initializations[-1]["resume"] == "must"
+        resumed.close()
+    else:
+        if not (_has_hydra and _has_omegaconf):
+            pytest.skip("requires hydra and omegaconf")
+        from omegaconf import OmegaConf
+
+        example_dir = (
+            pathlib.Path(__file__).parents[1] / "sota-implementations/dreamer_v3"
+        )
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = runpy.run_path(
+            example_dir / "train.py", run_name="dreamer_v3_logger_test"
+        )
+        cfg = OmegaConf.load(example_dir / "config.yaml")
+        cfg.logger.backend = "wandb"
+        cfg.logger.base_url = base_url
+        run_logger = example["_RunLogger"](cfg, None)
+        state = run_logger.logger.state_dict()
+        assert state["local"]["id"] == "generated-run"
+        run_logger.finish()
+        resumed = example["_RunLogger"](cfg, None, state)
+        assert initializations[-1]["id"] == "generated-run"
+        assert initializations[-1]["resume"] == "must"
+        resumed.log({"type": "train", "environment_steps": 32, "loss": 1.0})
+        resumed.logger.experiment.log.assert_called_once_with(
+            {"environment_steps": 32, "train/loss": 1.0}
+        )
+        resumed.finish()
+
+    assert calls == [("login", base_url), ("init", base_url)] * 2
+
+
+class TestWandbIdentity:
+    def test_rejects_other_run(self, monkeypatch):
+        run_ids = iter(["run-a", "run-b", "run-a"])
+
+        def init(**kwargs):
+            return argparse.Namespace(
+                config={}, define_metric=mock.Mock(), id=next(run_ids), log=mock.Mock()
+            )
+
+        monkeypatch.setitem(sys.modules, "wandb", argparse.Namespace(init=init))
+        monkeypatch.setattr(wandb_logger_module, "_has_wandb", True)
+
+        source = WandbLogger(exp_name="test", log_env_packages=False)
+        source.log_scalar("reward", 1.0)
+        state = source.state_dict()
+        assert state["local"]["id"] == "run-a"
+
+        # A logger attached to another run must not silently rebind its id while
+        # its metrics keep flowing to the new run.
+        other = WandbLogger(exp_name="test", log_env_packages=False)
+        with pytest.raises(RuntimeError, match="run 'run-b'.*run 'run-a'"):
+            other.load_state_dict(state)
+
+        same = WandbLogger(
+            exp_name="test", id="run-a", resume="must", log_env_packages=False
+        )
+        same.load_state_dict(state)
+        assert same._step_registry == source._step_registry
 
 
 @pytest.mark.skipif(not _has_wandb, reason="Wandb not installed")

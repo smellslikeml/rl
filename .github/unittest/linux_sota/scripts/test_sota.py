@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import torch
+from tensordict import TensorDict
 from tensordict.nn import composite_lp_aggregate
 
 # Check that we're using the new behavior
@@ -15,6 +17,70 @@ assert (
 ), "Composite LP must be set to False. Run this test with COMPOSITE_LP_AGGREGATE=0"
 
 commands = {
+    "dqn_trainer_resume": """python sota-implementations/dqn_trainer/train.py \
+  collector.total_frames=2000 \
+  collector.frames_per_batch=1000 \
+  collector.init_random_frames=1000 \
+  trainer.optim_steps_per_batch=2 \
+  trainer.progress_bar=false \
+  hydra.run.dir=outputs/sota_dqn_trainer \
+&& python sota-implementations/dqn_trainer/train.py \
+  resume=outputs/sota_dqn_trainer/checkpoints \
+  collector.total_frames=3000 \
+  trainer.progress_bar=false \
+  hydra.run.dir=outputs/sota_dqn_trainer_resumed
+""",
+    "sac_resume": """python sota-implementations/sac/sac.py \
+  collector.total_frames=48 \
+  collector.init_random_frames=10 \
+  collector.frames_per_batch=16 \
+  collector.env_per_collector=2 \
+  optim.batch_size=10 \
+  optim.utd_ratio=1 \
+  replay_buffer.size=120 \
+  env.name=Pendulum-v1 \
+  logger.backend= \
+  checkpoint.interval=16 \
+  hydra.run.dir=outputs/sota_sac \
+&& python sota-implementations/sac/sac.py \
+  resume=outputs/sota_sac/checkpoints \
+  collector.total_frames=80 \
+  hydra.run.dir=outputs/sota_sac_resumed
+""",
+    "td3_resume": """python sota-implementations/td3/td3.py \
+  collector.total_frames=48 \
+  collector.init_random_frames=10 \
+  optim.batch_size=10 \
+  collector.frames_per_batch=16 \
+  collector.num_workers=4 \
+  collector.env_per_collector=2 \
+  logger.mode=offline \
+  env.name=Pendulum-v1 \
+  logger.backend= \
+  checkpoint.interval=16 \
+  hydra.run.dir=outputs/sota_td3 \
+&& python sota-implementations/td3/td3.py \
+  resume=outputs/sota_td3/checkpoints \
+  collector.total_frames=80 \
+  hydra.run.dir=outputs/sota_td3_resumed
+""",
+    "ddpg_resume": """python sota-implementations/ddpg/ddpg.py \
+  collector.total_frames=48 \
+  collector.init_random_frames=10 \
+  optim.batch_size=10 \
+  collector.frames_per_batch=16 \
+  collector.env_per_collector=2 \
+  optim.utd_ratio=1 \
+  replay_buffer.size=120 \
+  env.name=Pendulum-v1 \
+  logger.backend= \
+  checkpoint.interval=16 \
+  hydra.run.dir=outputs/sota_ddpg \
+&& python sota-implementations/ddpg/ddpg.py \
+  resume=outputs/sota_ddpg/checkpoints \
+  collector.total_frames=80 \
+  hydra.run.dir=outputs/sota_ddpg_resumed
+""",
     "vla_grpo": """python sota-implementations/vla_grpo/vla-grpo.py \
   collector.groups_per_iter=2 \
   collector.group_size=2 \
@@ -347,6 +413,7 @@ commands = {
   replay_buffer.seq_len=4 \
   replay_buffer.warmup_factor=1 \
   optimization.updates_per_batch=1 \
+  optimization.compile=off \
   logger.eval_every=200 \
   logger.eval_episodes=1 \
   logger.output_plot= \
@@ -360,10 +427,41 @@ commands = {
   networks.num_classes=2 \
   networks.num_reward_bins=11 \
   networks.num_value_bins=11 \
-  networks.rnn_hidden_dim=8 \
-  networks.obs_embed_dim=8
+  networks.rnn_hidden_dim=8
 """,
 }
+
+_OFFLINE_DATASETS = {
+    "gail": "halfcheetah-expert-v2",
+    "td3_bc": "halfcheetah-medium-v2",
+}
+
+
+def _write_synthetic_d4rl_dataset(root: Path, dataset_id: str) -> None:
+    generator = torch.Generator().manual_seed(0)
+    size = 512
+    done = torch.zeros(size, 1, dtype=torch.bool)
+    truncated = torch.zeros_like(done)
+    dataset = TensorDict(
+        {
+            "observation": torch.randn(size, 17, generator=generator),
+            "action": torch.randn(size, 6, generator=generator).tanh(),
+            "reward": torch.randn(size, 1, generator=generator),
+            "done": done,
+            "terminated": done.clone(),
+            "truncated": truncated,
+            "next": {
+                "observation": torch.randn(size, 17, generator=generator),
+                "reward": torch.randn(size, 1, generator=generator),
+                "done": done.clone(),
+                "terminated": done.clone(),
+                "truncated": truncated.clone(),
+            },
+        },
+        [size],
+    )
+    dataset.memmap_(root / ".cache" / "torchrl" / "d4rl" / dataset_id)
+
 
 # CI sharding: the smoke list runs as SOTA_NUM_SHARDS parallel jobs, each
 # selecting an interleaved slice of the sorted command list via SOTA_SHARD
@@ -412,5 +510,9 @@ def run_command(command):
 
 
 @pytest.mark.parametrize("algo", list(commands))
-def test_commands(algo):
+def test_commands(algo, monkeypatch, tmp_path):
+    dataset_id = _OFFLINE_DATASETS.get(algo)
+    if dataset_id is not None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        _write_synthetic_d4rl_dataset(tmp_path, dataset_id)
     run_command(commands[algo])

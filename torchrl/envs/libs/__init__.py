@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from .brax import BraxEnv, BraxWrapper
+from .craftground import CraftGroundEnv, CraftGroundWrapper
 from .dm_control import DMControlEnv, DMControlWrapper
 from .envpool import MultiThreadedEnv, MultiThreadedEnvWrapper
 from .genesis import GenesisEnv, GenesisWrapper
@@ -20,6 +21,7 @@ from .habitat import HabitatEnv
 from .isaac_lab import IsaacLabWrapper
 from .isaacgym import IsaacGymEnv, IsaacGymWrapper
 from .jumanji import JumanjiEnv, JumanjiWrapper
+from .lbforaging import LBForagingEnv, LBForagingWrapper
 from .libero import LiberoEnv, LiberoWrapper
 from .meltingpot import MeltingpotEnv, MeltingpotWrapper
 from .mjlab import MJLabEnv, MJLabWrapper
@@ -42,6 +44,8 @@ from .vmas import VmasEnv, VmasWrapper
 __all__ = [
     "BraxEnv",
     "BraxWrapper",
+    "CraftGroundEnv",
+    "CraftGroundWrapper",
     "DMControlEnv",
     "DMControlWrapper",
     "GenesisEnv",
@@ -54,6 +58,8 @@ __all__ = [
     "IsaacLabWrapper",
     "JumanjiEnv",
     "JumanjiWrapper",
+    "LBForagingEnv",
+    "LBForagingWrapper",
     "LiberoEnv",
     "LiberoWrapper",
     "MOGymEnv",

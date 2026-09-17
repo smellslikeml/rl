@@ -1,5 +1,5 @@
 torch==2.12.0
-transformers==5.5.0
+transformers==5.10.1
 peft==0.15.2
 bitsandbytes==0.46.0
 datasets==3.6.0
@@ -11,6 +11,6 @@ tensordict==0.9.0
 vllm==0.26.0
 accelerate==1.7.0
 xformers==0.0.30 
-nltk==3.10.0
+nltk==3.10.3
 langdetect==1.0.9
 immutabledict==4.2.1

@@ -21,6 +21,7 @@ from torchrl.trainers.algorithms.configs.common import _normalize_hydra_key, Con
 from torchrl.trainers.algorithms.cql import CQLTrainer
 from torchrl.trainers.algorithms.ddpg import DDPGTrainer
 from torchrl.trainers.algorithms.dqn import DQNTrainer
+from torchrl.trainers.algorithms.grpo import GRPOTrainer
 from torchrl.trainers.algorithms.iql import IQLTrainer
 from torchrl.trainers.algorithms.offline_to_online import OfflineToOnlineTrainer
 from torchrl.trainers.algorithms.ppo import PPOTrainer
@@ -426,6 +427,10 @@ class OnPolicyTrainerConfig(TrainerConfig):
         lr_scheduler: Learning-rate scheduler (or a partial configuration taking
             the optimizer as input), stepped once per collected batch via
             :class:`~torchrl.trainers.LRSchedulerHook`.
+        target_net_updater: Target-parameter updater (or a partial configuration
+            taking the loss module as input, e.g. ``SoftUpdateConfig``), stepped
+            after every optimizer step. Pair it with ``PPOLossConfig(delay_actor=True)``
+            for PPO-EWMA.
         weight_update_map: Mapping from collector destination paths to trainer source paths.
             Required if collector has weight_sync_schemes configured.
             Example: ``{"policy": "loss_module.actor_network", "replay_buffer.transforms[0]": "loss_module.critic_network"}``.
@@ -475,7 +480,10 @@ class OnPolicyTrainerConfig(TrainerConfig):
     add_gae: bool = True
     gae: Any = None
     lr_scheduler: Any = None
-    weight_update_map: dict[str, str] | None = None
+    target_net_updater: Any = None
+    # ``Any`` rather than ``dict[str, str] | None``: OmegaConf cannot merge a
+    # mapping into a typed optional-dict field whose default is ``None``
+    weight_update_map: Any = None
     log_timings: bool = False
     auto_log_optim_steps: bool = True
     batch_size: int | None = None
@@ -571,6 +579,7 @@ def _make_onpolicy_trainer(trainer_cls, *args, **kwargs):
     gae = kwargs.pop("gae", None)
     kwargs.pop("create_env_fn", None)
     lr_scheduler = kwargs.pop("lr_scheduler", None)
+    target_net_updater = kwargs.pop("target_net_updater", None)
     weight_update_map = kwargs.pop("weight_update_map", None)
     log_timings = kwargs.pop("log_timings", False)
     auto_log_optim_steps = kwargs.pop("auto_log_optim_steps", True)
@@ -635,6 +644,11 @@ def _make_onpolicy_trainer(trainer_cls, *args, **kwargs):
     ):
         # then it's a partial config taking the optimizer as input
         lr_scheduler = lr_scheduler(optimizer)
+    if target_net_updater is not None and not isinstance(
+        target_net_updater, TargetNetUpdater
+    ):
+        # then it's a partial config taking the loss module as input
+        target_net_updater = target_net_updater(loss_module)
 
     # Quick instance checks
     if not isinstance(collector, BaseCollector):
@@ -659,6 +673,7 @@ def _make_onpolicy_trainer(trainer_cls, *args, **kwargs):
         loss_module=loss_module,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
+        target_net_updater=target_net_updater,
         logger=logger,
         clip_grad_norm=clip_grad_norm,
         clip_norm=clip_norm,
@@ -1530,13 +1545,6 @@ def _make_td3_trainer(*args, **kwargs) -> TD3Trainer:
         elif replay_buffer is not None:
             collector = collector(replay_buffer=replay_buffer, **collector_kwargs)
 
-    env = collector.env
-    action_spec = getattr(env, "action_spec_unbatched", None) or env.action_spec
-    if hasattr(action_spec, "get"):
-        nested_action_spec = action_spec.get("action", default=None)
-        if nested_action_spec is not None:
-            action_spec = nested_action_spec
-
     if not callable(loss_module):
         # TD3Loss currently requires real action bounds from the environment. Therefore, we
         # require it to be a partial for now.
@@ -1546,11 +1554,23 @@ def _make_td3_trainer(*args, **kwargs) -> TD3Trainer:
             "trainer inject actor_network, qvalue_network, and action_spec."
         )
     else:
-        loss_module = loss_module(
-            action_spec=action_spec,
-            actor_network=actor_network,
-            qvalue_network=qvalue_network,
+        loss_kwargs = {
+            "actor_network": actor_network,
+            "qvalue_network": qvalue_network,
+        }
+        partial_kwargs = getattr(loss_module, "keywords", None) or {}
+        has_action_domain = any(
+            partial_kwargs.get(key) is not None for key in ("action_spec", "bounds")
         )
+        if not has_action_domain and hasattr(collector, "env"):
+            env = collector.env
+            action_spec = getattr(env, "action_spec_unbatched", None) or env.action_spec
+            if hasattr(action_spec, "get"):
+                nested_action_spec = action_spec.get("action", default=None)
+                if nested_action_spec is not None:
+                    action_spec = nested_action_spec
+            loss_kwargs["action_spec"] = action_spec
+        loss_module = loss_module(**loss_kwargs)
 
     if value_estimator_gamma is not None:
         loss_module.make_value_estimator(gamma=value_estimator_gamma)
@@ -1635,6 +1655,109 @@ def _make_td3_trainer(*args, **kwargs) -> TD3Trainer:
         auto_log_optim_steps=auto_log_optim_steps,
         target_net_updater=target_net_updater,
         exploration_module=exploration_module,
+    )
+    _register_trainer_hooks(trainer, hooks)
+    return trainer
+
+
+@dataclass
+class GRPOTrainerConfig(TrainerConfig):
+    """Hydra configuration for :class:`~torchrl.trainers.algorithms.GRPOTrainer`.
+
+    Every kwarg accepted by ``GRPOTrainer.__init__`` is exposed as a field
+    here. ``autocast_dtype`` is a dtype name (e.g. ``"bfloat16"``); ``None``
+    keeps the trainer default (``torch.bfloat16``).
+    """
+
+    collector: Any
+    total_frames: int
+    loss_module: Any
+    optim_steps_per_batch: int | None = None
+    optimizer: Any | None = None
+    optimization_stepper: Any | None = None
+    # LLM-specific
+    weight_sync_sender: Any | None = None
+    weight_update_frequency: int = 1
+    empty_replay_buffer_on_weight_update: bool = False
+    # Replay buffer
+    replay_buffer: Any | None = None
+    batch_size: int | None = None
+    device: Any = None
+    # Mixed precision / gradient accumulation
+    mixed_precision: bool = False
+    autocast_dtype: str | None = None
+    gradient_accumulation_steps: int = 1
+    # Standard trainer args
+    logger: Any | None = None
+    clip_norm: float | None = 1.0
+    progress_bar: bool = True
+    seed: int | None = None
+    save_trainer_interval: int = 10000
+    log_interval: int = 10000
+    save_trainer_file: Any | None = None
+    checkpoint: Any | None = None
+    checkpoint_rotation: Any | None = None
+    checkpoint_metadata: Any | None = None
+    num_epochs: int = 1
+    async_collection: bool = False
+    log_timings: bool = False
+    auto_log_optim_steps: bool = True
+    # Logging toggles
+    log_rewards: bool = True
+    log_kl: bool = True
+    frame_skip: int = 1
+    hooks: list[Any] | None = None
+    _target_: str = "torchrl.trainers.algorithms.configs.trainers._make_grpo_trainer"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+
+def _make_grpo_trainer(**kwargs) -> GRPOTrainer:
+    from torchrl.trainers.trainers import Logger
+
+    collector = kwargs.pop("collector")
+    total_frames = kwargs.pop("total_frames")
+    if total_frames is None:
+        total_frames = collector.total_frames
+    loss_module = kwargs.pop("loss_module")
+    optimizer = kwargs.pop("optimizer", None)
+    replay_buffer = kwargs.pop("replay_buffer", None)
+    async_collection = kwargs.pop("async_collection", False)
+    autocast_dtype = kwargs.pop("autocast_dtype", None)
+    logger = kwargs.pop("logger", None)
+    hooks = kwargs.pop("hooks", None)
+
+    # Instantiate partial configs, mirroring the other trainer factories
+    if not isinstance(collector, BaseCollector):
+        if not async_collection:
+            collector = collector()
+        else:
+            collector = collector(replay_buffer=replay_buffer)
+    if not isinstance(loss_module, torch.nn.Module):
+        loss_module = loss_module()
+    if optimizer is not None and not isinstance(optimizer, torch.optim.Optimizer):
+        optimizer = optimizer(params=loss_module.parameters())
+
+    if logger is not None and not isinstance(logger, Logger):
+        raise TypeError(f"logger must be a Logger or None, got {type(logger)}")
+
+    if autocast_dtype is not None:
+        if not hasattr(torch, autocast_dtype) or not isinstance(
+            getattr(torch, autocast_dtype), torch.dtype
+        ):
+            raise ValueError(f"Unknown dtype name: {autocast_dtype!r}")
+        kwargs["autocast_dtype"] = getattr(torch, autocast_dtype)
+
+    trainer = GRPOTrainer(
+        collector=collector,
+        total_frames=total_frames,
+        loss_module=loss_module,
+        optimizer=optimizer,
+        replay_buffer=replay_buffer,
+        async_collection=async_collection,
+        logger=logger,
+        **kwargs,
     )
     _register_trainer_hooks(trainer, hooks)
     return trainer

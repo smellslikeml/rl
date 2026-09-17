@@ -4,8 +4,10 @@
 # LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
+import functools as ft
 import gc
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -39,7 +41,7 @@ from torchrl.envs import (
 from torchrl.envs.batched_envs import _stackable
 from torchrl.envs.libs.dm_control import _has_dmc, DMControlEnv
 from torchrl.envs.libs.gym import GymEnv
-from torchrl.envs.transforms import Compose, StepCounter
+from torchrl.envs.transforms import Compose, StepCounter, Transform
 from torchrl.modules import ActorCriticOperator, MLP, SafeModule, ValueOperator
 from torchrl.testing import (
     CARTPOLE_VERSIONED,
@@ -143,7 +145,8 @@ class TestParallel:
                 4, make_env, create_env_kwargs=[{"seed": 0}, {"seed": 1}]
             )
 
-    def test_metadata_from_workers_uses_live_envs(self, tmp_path):
+    @pytest.mark.parametrize("use_buffers", [None, True, False])
+    def test_metadata_from_workers_uses_live_envs(self, tmp_path, use_buffers):
         env = ParallelEnv(
             2,
             _WorkerMetadataToyEnv,
@@ -151,12 +154,12 @@ class TestParallel:
                 {"worker_idx": i, "marker_dir": str(tmp_path)} for i in range(2)
             ],
             metadata_from_workers=True,
-            use_buffers=False,
+            use_buffers=use_buffers,
             mp_start_method="spawn",
         )
         try:
             assert not env.is_closed
-            assert env._use_buffers is False
+            assert env._use_buffers is (use_buffers is not False)
             constructed = list(tmp_path.glob("constructed-*"))
             assert len(constructed) == 2
             assert all(f"-{os.getpid()}" not in path.name for path in constructed)
@@ -166,15 +169,6 @@ class TestParallel:
         finally:
             env.close(raise_if_closed=False)
         assert len(list(tmp_path.glob("closed-*"))) == 2
-
-    def test_metadata_from_workers_rejects_buffers(self):
-        with pytest.raises(RuntimeError, match="requires use_buffers=False"):
-            ParallelEnv(
-                2,
-                CountingEnv,
-                metadata_from_workers=True,
-                use_buffers=True,
-            )
 
     def test_metadata_from_workers_rejects_incompatible_schemas(self, tmp_path):
         with pytest.raises(RuntimeError, match="metadata are incompatible"):
@@ -243,6 +237,64 @@ class TestParallel:
         try:
             assert isinstance(env, SerialEnv)
             env.reset()
+        finally:
+            env.close(raise_if_closed=False)
+
+    def test_no_buffers_partial_reset_keeps_current_state(self, maybe_fork_ParallelEnv):
+        # Without buffers, workers that are not reset used to come back as
+        # empty slots when the caller passed only the reset signal (the
+        # collector's maybe_reset), which broke transforms reading the
+        # observation on reset and left a ragged lazy stack.
+        class ReadsObservationOnReset(Transform):
+            def _reset(self, tensordict, tensordict_reset):
+                assert tensordict_reset["observation"].shape[0] == 2
+                return tensordict_reset
+
+        env = TransformedEnv(
+            maybe_fork_ParallelEnv(2, CountingEnv, use_buffers=False),
+            ReadsObservationOnReset(),
+        )
+        try:
+            td = env.reset()
+            td = env.step(td.update(self._ones_action(env)))
+            td = env.step(td.update(self._ones_action(env)))
+            kept = td["next", "observation"][1].clone()
+            td["next", "done"][0] = True
+            td["next", "terminated"][0] = True
+            out = env.maybe_reset(env.step_mdp(td))
+            assert not isinstance(out, LazyStackedTensorDict)
+            assert (out["observation"][0] == 0).all()
+            assert (out["observation"][1] == kept).all()
+            assert not out["done"].any()
+        finally:
+            env.close(raise_if_closed=False)
+
+    @pytest.mark.parametrize("step", [False, True])
+    def test_no_buffers_partial_reset_cache_is_independent(
+        self, step, maybe_fork_ParallelEnv
+    ):
+        # Different observation shapes force a lazy stack that aliases its rows.
+        env = maybe_fork_ParallelEnv(
+            2,
+            [
+                CountingEnv,
+                ft.partial(
+                    TransformedEnv,
+                    CountingEnv(),
+                    CatFrames(N=2, dim=-1, in_keys=["observation"]),
+                ),
+            ],
+            use_buffers=False,
+        )
+        try:
+            td = env.reset()
+            if step:
+                td = env.step(td.update(self._ones_action(env)))["next"]
+            kept = td[1]["observation"].clone()
+            td[1]["observation"].fill_(99)
+            reset = TensorDict({"_reset": torch.tensor([[True], [False]])}, [2])
+            out = env._reset(reset)
+            torch.testing.assert_close(out[1]["observation"], kept)
         finally:
             env.close(raise_if_closed=False)
 
@@ -401,6 +453,26 @@ class TestParallel:
                     torch.testing.assert_close(
                         self._batched_count(indexed_env), expected[selected]
                     )
+                    if parallel and not use_buffers:
+                        # Mask-only resets must read the same worker state
+                        # through both an indexed view and its parent.
+                        for target, observation in (
+                            (indexed_env, expected[selected]),
+                            (env, expected),
+                        ):
+                            reset = TensorDict(
+                                {
+                                    "_reset": torch.zeros_like(
+                                        observation, dtype=torch.bool
+                                    )
+                                },
+                                target.batch_size,
+                            )
+                            # Inspect the data delivered to reset transforms,
+                            # before EnvBase merges it with the caller's input.
+                            torch.testing.assert_close(
+                                target._reset(reset)["observation"], observation
+                            )
                 finally:
                     indexed_env.close(raise_if_closed=False)
 
@@ -1639,6 +1711,36 @@ def test_heterogeneous_non_tensor_workers(cls, maybe_fork_ParallelEnv):
         env.close(raise_if_closed=False)
 
 
+@pytest.mark.parametrize("metadata_from_workers", [False, True])
+@pytest.mark.parametrize("use_buffers", [None, True, False])
+def test_parallel_env_metadata_from_workers_buffers(metadata_from_workers, use_buffers):
+    class SlowCountingEnv(CountingEnv):
+        def _step(self, tensordict):
+            # Expose premature completion after loading worker state.
+            time.sleep(0.1)
+            return super()._step(tensordict)
+
+    env = ParallelEnv(
+        2,
+        SlowCountingEnv,
+        metadata_from_workers=metadata_from_workers,
+        use_buffers=use_buffers,
+    )
+    try:
+        assert env._use_buffers is (use_buffers is not False)
+        for _ in range(2):  # The second reset restarts the closed workers.
+            td = env.reset()
+            env.load_state_dict(env.state_dict())
+            td["action"] = env.action_spec.one()
+            td = env.step(td)["next"]
+            assert td["observation"].tolist() == [[1], [1]]
+            td["_reset"] = torch.tensor([[True], [False]])
+            assert env.reset(td)["observation"].tolist() == [[0], [1]]
+            env.close()
+    finally:
+        env.close(raise_if_closed=False)
+
+
 def test_stackable():
     # Tests the _stackable util
     stack = [TensorDict({"a": 0}, []), TensorDict({"b": 1}, [])]
@@ -1655,3 +1757,7 @@ def test_stackable():
     assert not _stackable(*stack)
     stack = [TensorDict({"a": "a string"}, []), TensorDict({"a": "another string"}, [])]
     assert _stackable(*stack)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

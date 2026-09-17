@@ -80,6 +80,52 @@ model shape and deployment target are known. ``"pad"`` is the safest baseline,
 ``"scan"`` is the compile-friendly baseline, and ``"triton"`` is the
 performance-oriented CUDA backend.
 
+Optimized GRU scan backward
+---------------------------
+
+For :class:`GRUModule`, selecting ``recurrent_backend="scan"`` also selects a
+specialized first-order backward pass when ``recurrent_recompute="none"``
+(the default). The input projection is evaluated over the flattened
+batch-time dimensions, the reverse scan carries only the hidden-state
+gradient, and input and parameter gradients are reduced outside the recurrent
+loop. This avoids carrying the ordinary autograd graph through every timestep
+while preserving the same module parameters and recurrent-state semantics.
+
+No separate optimization flag is required:
+
+.. code-block:: python
+
+    gru = GRUModule(
+        input_size=4,
+        hidden_size=64,
+        recurrent_backend="scan",
+        in_keys=["observation", "recurrent_state", "is_init"],
+        out_keys=["features", ("next", "recurrent_state")],
+    )
+
+The optimized backward supports ordinary first-order training, including
+autocast BF16 inputs with FP32 parameters. It intentionally does not support
+double backward or :mod:`torch.func` transforms such as ``jacrev``, ``vmap``,
+and ``grad``. Set ``recurrent_recompute="full"`` to use the checkpointed
+reference loop when lower saved-activation memory is more important than the
+specialized backward.
+
+Backend performance depends on the device, batch size, rollout horizon, and
+hidden width. From a TorchRL source checkout, use the
+`recurrent backward benchmark
+<https://github.com/pytorch/rl/blob/main/benchmarks/bench_rnn_backward.py>`_
+to compare the available implementations on the target hardware:
+
+.. code-block:: bash
+
+    python benchmarks/bench_rnn_backward.py --rnn gru \
+        --backends cudnn,scan,triton \
+        --batches 256,1024 --seq-lens 64,512 --hiddens 128,512 \
+        --warmup 10 --iters 30
+
+The benchmark reports synchronized forward, backward, and total times plus
+peak allocated CUDA memory for every requested shape.
+
 Triton precision controls
 -------------------------
 
@@ -138,6 +184,72 @@ A module-level ``recurrent_matmul_precision=...`` value takes precedence over
 the process-wide setting. Use :func:`get_recurrent_matmul_precision` to inspect
 the resolved concrete mode for the current device.
 
+Transformer temporal policies
+-----------------------------
+
+:class:`TransformerModule` extends the same contract to causal transformers:
+observations are read from the TensorDict, features written back, and the
+``is_init`` key drives state resets. Collection runs one step at a time
+against a key/value cache, while training processes ``[B, T]`` windows under
+a block-diagonal causal mask so attention never crosses an episode boundary.
+The two paths share parameters and produce matching outputs.
+
+.. code-block:: python
+
+    from tensordict.nn import TensorDictModule, TensorDictSequential
+    from torch import nn
+    from torchrl.envs import GymEnv, InitTracker, TransformedEnv
+    from torchrl.modules import TransformerModule, set_recurrent_mode
+
+    env = TransformedEnv(GymEnv("Pendulum-v1"), InitTracker())
+    transformer = TransformerModule(
+        input_size=3,
+        hidden_size=64,
+        num_layers=2,
+        num_heads=4,
+        max_seq_len=256,
+        in_key="observation",
+        out_key="features",
+    )
+    policy = TensorDictSequential(
+        transformer,
+        TensorDictModule(nn.Linear(64, 1), in_keys=["features"], out_keys=["action"]),
+    )
+
+    rollout = env.rollout(100, policy)  # cached steps, no state in the rollout
+    with set_recurrent_mode(True):
+        window = transformer(rollout.exclude("features"))  # same features
+
+Unlike the RNN modules, no state travels in the TensorDict. The key/value
+cache is inference state owned by the module instance: the backbone allocates
+it on the first cached step in the dtype of its projections, one stream per
+batch position, and the module clears the streams flagged by ``is_init``,
+restarts every stream when the parameters change, and releases the cache on
+:meth:`~torchrl.modules.TransformerModule.reset_cache`; copies and pickled
+instances start with an empty cache. TorchRL's weight-synchronization paths
+(collectors and the inference server) notify the module through
+:meth:`~torchrl.modules.TransformerModule.mark_weight_update` once new
+weights are applied; call it yourself after updating parameters by other
+means. Under autocast the cache is allocated in the compute dtype, so no
+conversion happens on the hot path. Rollouts and replay buffers never carry
+a cache, whatever the context length. Use one module instance per collector
+(or per collector worker); batches whose composition changes between calls
+are not supported yet.
+
+Training windows must be episode-aligned: every row must start with
+``is_init=True``, which complete-trajectory sampling provides, and a window
+that starts mid-episode raises an error. The check is data-dependent, so it
+costs one graph break under :func:`torch.compile`; pass
+``validate_windows=False`` to compile the window path as a single graph and
+take responsibility for alignment. Episode boundaries inside a window
+are recovered from ``is_init`` through :func:`positions_from_is_init` and
+:func:`segment_causal_mask_from_is_init`. Any backbone honoring the
+:class:`CausalTransformer` contract (``forward``, ``new_kv_cache`` and
+``reset_kv_cache`` plus the ``num_layers``, ``num_heads``, ``head_dim`` and
+``max_seq_len`` attributes) can be passed via the ``transformer`` argument;
+the cache object is opaque to the module, so an adapter over an inference
+engine can keep it in the engine's own representation.
+
 Choosing a layout and backend
 -----------------------------
 
@@ -158,6 +270,8 @@ See also
 
 * :ref:`data-layout` for the contiguous trajectory layout and replay-buffer
   handoff.
+* :ref:`Recurrent state lifecycle <ref_recurrent_state_lifecycle>` for
+  the primer / ``auto_register_policy_transforms`` collection path.
 * :class:`LSTMModule` and :class:`GRUModule` for constructor arguments and
   examples.
 * :class:`set_recurrent_mode` for switching between single-step and recurrent

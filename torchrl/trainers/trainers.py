@@ -6,22 +6,25 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import itertools
 import json
 import math
 import pathlib
+import signal
 import sys
 import time
 import warnings
 import weakref
 from collections import defaultdict, OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from copy import deepcopy
 from textwrap import indent
 from typing import Any, Literal
 
 import numpy as np
-import torch.nn
+import torch
+from packaging import version
 from tensordict import NestedKey, NonTensorData, pad, TensorDict, TensorDictBase
 from tensordict._tensorcollection import TensorCollection
 from tensordict.nn import TensorDictModule
@@ -37,7 +40,13 @@ from torchrl._utils import (
     VERBOSE,
 )
 
-from torchrl.checkpoint import Checkpoint, CheckpointRotation
+from torchrl.checkpoint import (
+    Checkpoint,
+    CheckpointRotation,
+    GlobalRNGState,
+    resolve_checkpoint_path,
+    StopOnSignal,
+)
 from torchrl.collectors import BaseCollector
 from torchrl.collectors.utils import split_trajectories
 from torchrl.data.replay_buffers import (
@@ -51,6 +60,13 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.objectives.common import LossModule
 from torchrl.objectives.utils import TargetNetUpdater
 from torchrl.record.loggers import Logger
+
+_TORCH_GRAD_SCALER_HAS_DEVICE = version.parse(torch.__version__).release >= (2, 3)
+
+if _TORCH_GRAD_SCALER_HAS_DEVICE:
+    from torch.amp import GradScaler
+else:
+    from torch.cuda.amp import GradScaler
 
 try:
     from tqdm import tqdm
@@ -81,6 +97,17 @@ LOGGER_METHODS = {
 # Format strings for different data types in progress bar display
 TYPE_DESCR = {float: "4.4f", int: ""}
 REWARD_KEY = ("next", "reward")
+
+
+@implement_for("torch", "2.3")
+def _make_grad_scaler(device_type: str, enabled: bool) -> GradScaler:
+    return GradScaler(device_type, enabled=enabled)
+
+
+@implement_for("torch", None, "2.3")
+def _make_grad_scaler(device_type: str, enabled: bool) -> GradScaler:  # noqa: F811
+    return GradScaler(enabled=enabled)
+
 
 # On Windows, a memory-mapped checkpoint keeps the file locked for as long as
 # the loaded tensors are alive, so the checkpoint could neither be deleted nor
@@ -317,6 +344,224 @@ class DefaultOptimizationStepper(OptimizationStepper):
         return losses_td
 
 
+class MixedPrecisionOptimizationStepper(OptimizationStepper):
+    """Optimization step with mixed precision and gradient accumulation.
+
+    This stepper wraps each forward/backward pass in ``torch.amp.autocast``
+    and optionally scales gradients with ``torch.amp.GradScaler`` (for fp16).
+    It also implements *gradient accumulation*: gradients are accumulated for
+    ``gradient_accumulation_steps`` micro-batches before the optimizer is
+    stepped and zeroed.
+
+    It can be used with any :class:`~torchrl.trainers.Trainer`; LLM trainers
+    such as :class:`~torchrl.trainers.algorithms.GRPOTrainer` construct it by
+    default.
+
+    Args:
+        optimizer (optim.Optimizer): The optimizer to use.
+
+    Keyword Args:
+        mixed_precision (bool, optional): Whether to enable mixed-precision
+            training. Default: ``False``.
+        autocast_dtype (torch.dtype, optional): The dtype to use inside
+            ``autocast``. Default: ``torch.bfloat16``.
+        gradient_accumulation_steps (int, optional): Number of micro-batches
+            over which gradients are accumulated before a step. Default: ``1``.
+        clip_norm (float, optional): Maximum gradient norm for clipping.
+            Default: ``1.0``.
+        device_type (str, optional): Device type passed to ``autocast`` and
+            ``GradScaler`` (e.g. ``"cuda"`` or ``"cpu"``). Defaults to the
+            device type of the optimizer's first parameter.
+
+    .. note::
+        ``GradScaler`` is only enabled when ``mixed_precision=True`` *and*
+        ``autocast_dtype=torch.float16``.  With bfloat16 (the recommended
+        dtype for modern GPUs) the scaler is a no-op and is not created.
+    """
+
+    def __init__(
+        self,
+        optimizer: optim.Optimizer,
+        *,
+        mixed_precision: bool = False,
+        autocast_dtype: torch.dtype = torch.bfloat16,
+        gradient_accumulation_steps: int = 1,
+        clip_norm: float | None = 1.0,
+        device_type: str | None = None,
+    ) -> None:
+        if gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be >= 1")
+        self.optimizer = optimizer
+        self.mixed_precision = mixed_precision
+        self.autocast_dtype = autocast_dtype
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.clip_norm = clip_norm
+        if device_type is None:
+            params = [p for group in optimizer.param_groups for p in group["params"]]
+            device_type = params[0].device.type if params else "cpu"
+        self.device_type = device_type
+
+        # GradScaler is only useful for fp16; bf16 doesn't need it.
+        self._use_scaler = mixed_precision and (autocast_dtype == torch.float16)
+        self.scaler = _make_grad_scaler(self.device_type, self._use_scaler)
+
+        # Internal micro-batch counter (reset after every optimizer step).
+        self._micro_step: int = 0
+        self._optimizer_step_count: int = 0
+        self._skipped_nonfinite_steps: int = 0
+
+    @property
+    def optimizer_step_count(self) -> int:
+        """Number of completed optimizer steps.
+
+        Discounts gradient-accumulation micro-steps and steps skipped by the
+        GradScaler on overflow or by the non-finite guards. Read by hooks that
+        act on an optimizer-step cadence (e.g.
+        :class:`~torchrl.trainers.UpdateWeights` with
+        ``interval_unit="optim_steps"``).
+        """
+        return self._optimizer_step_count
+
+    # ------------------------------------------------------------------
+    # Checkpointing (optimizer + scaler state)
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict[str, Any]:
+        if self._micro_step % self.gradient_accumulation_steps != 0:
+            raise RuntimeError(
+                f"Cannot save stepper state mid-accumulation. (micro_step={self._micro_step}, "
+                f"accumulation_steps={self.gradient_accumulation_steps}). "
+                "Adjust your save_interval to align with the gradient accumulation window."
+            )
+
+        sd: dict[str, Any] = {
+            "optimizer": self.optimizer.state_dict(),
+            "micro_step": self._micro_step,
+            "optimizer_step_count": self._optimizer_step_count,
+            "skipped_nonfinite_steps": self._skipped_nonfinite_steps,
+        }
+        if self._use_scaler:
+            sd["scaler"] = self.scaler.state_dict()
+        return sd
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.optimizer.load_state_dict(state_dict["optimizer"])
+        self._micro_step = state_dict.get("micro_step", 0)
+        self._optimizer_step_count = state_dict.get("optimizer_step_count", 0)
+        self._skipped_nonfinite_steps = state_dict.get("skipped_nonfinite_steps", 0)
+        if self._use_scaler and "scaler" in state_dict:
+            self.scaler.load_state_dict(state_dict["scaler"])
+
+    # ------------------------------------------------------------------
+    # Core step
+    # ------------------------------------------------------------------
+
+    def step(self, trainer: Trainer, sub_batch: TensorDictBase) -> TensorDictBase:
+        """Perform one forward pass and scaled backward pass.
+
+        The optimizer is only stepped and zeroed every
+        ``gradient_accumulation_steps`` calls.
+
+        Args:
+            trainer (Trainer): The owning :class:`~torchrl.trainers.Trainer`.
+            sub_batch (TensorDictBase): Mini-batch used for this step.
+
+        Returns:
+            A :class:`~tensordict.TensorDict` with scalar metrics (losses,
+            grad_norm) suitable for logging.
+        """
+        # ---- forward pass (optionally under autocast) ----
+        with torch.amp.autocast(
+            self.device_type,
+            enabled=self.mixed_precision,
+            dtype=self.autocast_dtype,
+        ):
+            losses_td = trainer.compute_loss(sub_batch)
+            # Sum all loss_* keys and normalise by accumulation steps.
+            loss_items = [v for k, v in losses_td.items() if k.startswith("loss")]
+            if not loss_items:
+                raise RuntimeError(
+                    "The loss module returned no 'loss_*' keys. "
+                    "Make sure your loss module prefixes scalar outputs with 'loss'."
+                )
+            loss = sum(loss_items) / self.gradient_accumulation_steps
+
+        # ---- non-finite loss guard ----
+        # A single non-finite loss would poison the gradients accumulated so
+        # far, so the whole accumulation window is dropped and restarted.
+        if not torch.isfinite(loss.detach()).all():
+            self._skipped_nonfinite_steps += 1
+            torchrl_logger.warning(
+                f"Skipping optimization step because the loss is non-finite: "
+                f"{loss.detach()}. Skipped non-finite steps: "
+                f"{self._skipped_nonfinite_steps}."
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            self._micro_step = 0
+            return self._reduce_metrics(losses_td)
+
+        # ---- backward pass ----
+        if self._use_scaler:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        self._micro_step += 1
+
+        # ---- optimizer step every `gradient_accumulation_steps` micro-batches ----
+        grad_norm = None
+        if self._micro_step % self.gradient_accumulation_steps == 0:
+            if self._use_scaler:
+                self.scaler.unscale_(self.optimizer)
+
+            grad_norm = 0.0
+            if self.clip_norm is not None:
+                params = [
+                    p for group in self.optimizer.param_groups for p in group["params"]
+                ]
+                grad_norm = float(nn.utils.clip_grad_norm_(params, self.clip_norm))
+
+            if self._use_scaler:
+                scale_before = self.scaler.get_scale()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                # If scale dropped, an overflow occurred and optimizer.step() was skipped.
+                if self.scaler.get_scale() >= scale_before:
+                    self._optimizer_step_count += 1
+            elif self.clip_norm is not None and not math.isfinite(grad_norm):
+                # Without a GradScaler (e.g. bf16 or full precision) nothing
+                # skips overflowing updates, so guard the step explicitly.
+                self._skipped_nonfinite_steps += 1
+                torchrl_logger.warning(
+                    f"Skipping optimizer step because the gradient norm is "
+                    f"non-finite: {grad_norm}. Skipped non-finite steps: "
+                    f"{self._skipped_nonfinite_steps}."
+                )
+                grad_norm = 0.0
+            else:
+                self.optimizer.step()
+                self._optimizer_step_count += 1
+            self.optimizer.zero_grad(set_to_none=True)
+
+        metrics = self._reduce_metrics(losses_td)
+        if grad_norm is not None:
+            metrics["grad_norm"] = torch.tensor(grad_norm)
+        return metrics
+
+    @staticmethod
+    def _reduce_metrics(losses_td: TensorDictBase) -> TensorDictBase:
+        """Detach the loss output and reduce non-scalar entries to their mean.
+
+        Steppers must return scalar metrics suitable for logging; loss modules
+        such as :class:`~torchrl.objectives.llm.GRPOLoss` also emit per-token
+        diagnostics (KL divergences) that are reduced here.
+        """
+        metrics = {}
+        for key, value in losses_td.detach().items():
+            metrics[key] = value.float().mean() if value.numel() > 1 else value
+        return TensorDict(metrics, [])
+
+
 class Trainer:
     """A generic Trainer class.
 
@@ -363,7 +608,9 @@ class Trainer:
             Default is None (no saving)
         checkpoint (Checkpoint, optional): unified checkpoint object used for
             scheduled saves and restores. The trainer registers any missing
-            standard components on this object. When omitted, the legacy
+            standard components on this object, including the process-global
+            RNG state under ``"rng"``, which :meth:`load_from_file` restores
+            after every other component. When omitted, the legacy
             ``CKPT_BACKEND`` path is retained during the compatibility window.
         checkpoint_rotation (CheckpointRotation, optional): retention policy used
             for scheduled unified checkpoints. Requires ``checkpoint`` and cannot
@@ -672,6 +919,17 @@ class Trainer:
                 return policy
         return None
 
+    def _checkpoint_optimizer(self) -> Any | None:
+        """Return the optimizer owned by the Trainer or a legacy hook."""
+        optimizer = self.optimizer
+        if self._is_checkpointable(optimizer):
+            return optimizer
+        optimizer_hook = self._modules.get("optimizer")
+        hook_optimizer = getattr(optimizer_hook, "optimizer", optimizer_hook)
+        if self._is_checkpointable(hook_optimizer):
+            return hook_optimizer
+        return None
+
     def _sync_checkpoint_components(
         self, checkpoint: Checkpoint | None = None
     ) -> Checkpoint:
@@ -707,22 +965,14 @@ class Trainer:
             register("exploration", getattr(self, "exploration_module", None))
             for name, module in self._modules.items():
                 register(f"trainer_module.{name}", module)
+            register("rng", GlobalRNGState())
             register("learner_execution", self._execution_checkpoint_state)
             return checkpoint
 
         register("policy", self._checkpoint_policy())
         register("loss_module", self.loss_module)
 
-        optimizer = self.optimizer
-        if not self._is_checkpointable(optimizer):
-            optimizer_hook = self._modules.get("optimizer")
-            hook_optimizer = getattr(optimizer_hook, "optimizer", optimizer_hook)
-            optimizer = (
-                hook_optimizer
-                if self._is_checkpointable(hook_optimizer)
-                else optimizer_hook
-            )
-        register("optimizer", optimizer)
+        register("optimizer", self._checkpoint_optimizer())
 
         register("collector", self.collector)
         replay_buffer = getattr(self, "replay_buffer", None)
@@ -746,6 +996,7 @@ class Trainer:
             if name in ("optimizer", "replay_buffer") and name in checkpoint:
                 continue
             register(f"trainer_module.{name}", module)
+        register("rng", GlobalRNGState())
         return checkpoint
 
     def _wrap_hook_with_timing(
@@ -795,22 +1046,32 @@ class Trainer:
 
     @property
     def app_state(self):
+        optimizer = self._checkpoint_optimizer()
         self._app_state = {
             "state": StateDict(**self._get_state()),
             "collector": self.collector,
             "loss_module": self.loss_module,
-            **{k: item for k, item in self._modules.items()},
+            **({"optimizer": optimizer} if optimizer is not None else {}),
+            **{k: item for k, item in self._modules.items() if k != "optimizer"},
         }
         return self._app_state
 
     def state_dict(self) -> dict:
         state = self._get_state()
-        state_dict = OrderedDict(
+        state_dict: OrderedDict[str, Any] = OrderedDict(
             collector=self.collector.state_dict(),
             loss_module=self.loss_module.state_dict(),
             state=state,
-            **{k: item.state_dict() for k, item in self._modules.items()},
         )
+        optimizer = self._checkpoint_optimizer()
+        if optimizer is not None:
+            state_dict["optimizer"] = optimizer.state_dict()
+        for key, item in self._modules.items():
+            # The standard optimizer component is emitted above, while a
+            # legacy OptimizerHook may also be registered under this name.
+            if key == "optimizer":
+                continue
+            state_dict[key] = item.state_dict()
         return state_dict
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -819,7 +1080,13 @@ class Trainer:
 
         self.loss_module.load_state_dict(model_state_dict)
         self.collector.load_state_dict(collector_state_dict)
+        optimizer = self._checkpoint_optimizer()
+        optimizer_state_dict = state_dict.get("optimizer")
+        if optimizer is not None and optimizer_state_dict:
+            optimizer.load_state_dict(optimizer_state_dict)
         for key, item in self._modules.items():
+            if key == "optimizer":
+                continue
             item.load_state_dict(state_dict[key])
 
         self.collected_frames = state_dict["state"]["collected_frames"]
@@ -831,6 +1098,33 @@ class Trainer:
         """Signal that training should stop at the next loop boundary."""
         self._stop_training = True
         self._stop_reason = reason
+
+    @contextlib.contextmanager
+    def stop_on_signal(
+        self, signals: Collection[int] = (signal.SIGINT, signal.SIGTERM)
+    ):
+        """Stop training cleanly when the process receives a termination signal.
+
+        Wrap :meth:`train` in this context. The first signal calls
+        :meth:`request_stop`, so the loop finishes the current batch, writes a
+        final checkpoint when a save destination is configured, shuts the
+        collector down and returns. A second signal raises
+        :class:`KeyboardInterrupt`. Previous handlers are restored on exit.
+
+        Args:
+            signals (Collection[int], optional): signal numbers to handle.
+                Defaults to ``SIGINT`` and ``SIGTERM``.
+
+        Examples:
+            >>> with trainer.stop_on_signal():  # doctest: +SKIP
+            ...     trainer.train()
+
+        """
+        with StopOnSignal(
+            signals,
+            on_request=lambda name: self.request_stop(f"received {name}"),
+        ) as stop:
+            yield stop
 
     def _save_trainer(self) -> None:
         if self.checkpoint is not None:
@@ -886,7 +1180,11 @@ class Trainer:
             # Non-tensor values (scalars, bools, nested dicts) are wrapped in
             # NonTensorData automatically by _state_dict_to_td, so no pickle
             # dependency is needed.
-            for key in ("loss_module", "collector", *self._modules):
+            for key in dict.fromkeys(
+                ("loss_module", "collector", "optimizer", *self._modules)
+            ):
+                if key not in state:
+                    continue
                 sd = state[key]
                 if sd:
                     _state_dict_to_td(sd).dumps(str(path / key))
@@ -916,14 +1214,59 @@ class Trainer:
         )
         return metadata
 
+    def _save_interval_elapsed(self) -> bool:
+        return (self.collected_frames - self._last_save) > self.save_trainer_interval
+
+    def _save_due(self, force_save: bool = False) -> bool:
+        """Whether a destination is configured and a save is due now."""
+        return self._has_checkpoint_destination() and (
+            force_save or self._save_interval_elapsed()
+        )
+
     def save_trainer(self, force_save: bool = False) -> None:
-        _save = force_save
-        if self._has_checkpoint_destination():
-            if (self.collected_frames - self._last_save) > self.save_trainer_interval:
-                self._last_save = self.collected_frames
-                _save = True
-        if _save and self._has_checkpoint_destination():
-            self._save_trainer()
+        if not self._has_checkpoint_destination():
+            return
+        if self._save_interval_elapsed():
+            self._last_save = self.collected_frames
+        elif not force_save:
+            return
+        self._save_trainer()
+
+    def _save_trainer_at_boundary(self, *, force_save: bool = False) -> None:
+        """Save at a training-loop boundary, pausing free-running collection."""
+        if self._save_due(force_save):
+            with self._collection_paused():
+                self.save_trainer(force_save=force_save)
+
+    @contextlib.contextmanager
+    def _collection_paused(self):
+        """Pause an asynchronous collector while a checkpoint is written."""
+        pause = (
+            getattr(self.collector, "pause", None) if self.async_collection else None
+        )
+        with contextlib.ExitStack() as stack:
+            if pause is not None:
+                try:
+                    stack.enter_context(pause())
+                except NotImplementedError:
+                    if "collector.pause" not in self._checkpoint_skip_warnings:
+                        torchrl_logger.warning(
+                            "%s does not implement pause(); asynchronous checkpoints "
+                            "are written while collection continues.",
+                            type(self.collector).__name__,
+                        )
+                        self._checkpoint_skip_warnings.add("collector.pause")
+            yield
+
+    def _resolve_checkpoint_path(self, file: str | pathlib.Path) -> str | pathlib.Path:
+        """Map a rotation directory to its newest checkpoint; pass other inputs through."""
+        if not isinstance(file, (str, pathlib.PurePath)):
+            return file
+        path = pathlib.Path(file).expanduser()
+        if not path.is_dir() or (path / "state.json").exists():
+            # A file, an archive, or a legacy memmap trainer directory.
+            return file
+        return resolve_checkpoint_path(path)
 
     def load_from_file(self, file: str | pathlib.Path, **kwargs) -> Trainer:
         """Loads a file and its state-dict in the trainer.
@@ -960,7 +1303,12 @@ class Trainer:
             trainer synchronizes the collector once so local policy copies and
             remote workers observe the restored learner weights.
 
+        .. note::
+            ``file`` may also be a :class:`~torchrl.checkpoint.CheckpointRotation`
+            directory, in which case its newest checkpoint is restored.
+
         """
+        file = self._resolve_checkpoint_path(file)
         if Checkpoint.is_checkpoint(file):
             checkpoint = self.checkpoint
             if checkpoint is None:
@@ -970,10 +1318,19 @@ class Trainer:
             for key, value in _torch_load_defaults().items():
                 kwargs.setdefault(key, value)
             checkpoint = self._sync_checkpoint_components(checkpoint)
+            load_kwargs = {
+                "map_location": map_location,
+                "tensor_load_kwargs": kwargs,
+                "strict": strict,
+            }
+            registered = set(checkpoint.components)
+            load_rng = (
+                "rng" in registered and "rng" in Checkpoint.manifest(file)["components"]
+            )
+            registered.discard("rng")
             if self.learner_backend == "ray":
                 # Service owners must be restored before learner actors create
                 # rank-aware clients. The learner state is deliberately last.
-                registered = set(checkpoint.components)
                 ordered = [
                     name
                     for name in ("replay_buffer", "collector")
@@ -990,22 +1347,11 @@ class Trainer:
                     ordered.append("learner_execution")
                 loaded = set()
                 for name in ordered:
-                    result = checkpoint.load(
-                        file,
-                        components=[name],
-                        map_location=map_location,
-                        tensor_load_kwargs=kwargs,
-                        strict=strict,
-                    )
+                    result = checkpoint.load(file, components=[name], **load_kwargs)
                     loaded.update(result.loaded)
             else:
-                result = checkpoint.load(
-                    file,
-                    map_location=map_location,
-                    tensor_load_kwargs=kwargs,
-                    strict=strict,
-                )
-                loaded = result.loaded
+                result = checkpoint.load(file, components=registered, **load_kwargs)
+                loaded = set(result.loaded)
             if "learner_execution" in loaded:
                 self._publish_execution_weights(force=True)
             elif "policy" in loaded:
@@ -1018,18 +1364,26 @@ class Trainer:
                     self.collector.update_policy_weights_()
                 else:
                     self.collector.update_policy_weights_(policy)
+            if load_rng:
+                result = checkpoint.load(file, components=["rng"], **load_kwargs)
+                loaded.update(result.loaded)
         elif _CKPT_BACKEND == "torchsnapshot":
             snapshot = Snapshot(path=file)
             snapshot.restore(app_state=self.app_state)
         elif _CKPT_BACKEND == "torch":
             for key, value in _torch_load_defaults().items():
                 kwargs.setdefault(key, value)
+            if isinstance(file, pathlib.Path):
+                # Older torch versions require a string path when mmap is set.
+                file = str(file)
             loaded_dict: OrderedDict = torch.load(file, **kwargs)
             self.load_state_dict(loaded_dict)
         elif _CKPT_BACKEND == "memmap":
             path = pathlib.Path(file)
             state: dict = {}
-            for key in ("loss_module", "collector", *self._modules):
+            for key in dict.fromkeys(
+                ("loss_module", "collector", "optimizer", *self._modules)
+            ):
                 key_path = path / key
                 if key_path.exists():
                     state[key] = _td_to_state_dict(
@@ -1401,65 +1755,79 @@ class Trainer:
         if self.learner_backend == "ray":
             return self._train_with_execution_backend()
         if self.progress_bar:
-            self._pbar = tqdm(total=self.total_frames)
+            self._pbar = tqdm(total=self.total_frames, initial=self.collected_frames)
             self._pbar_str = {}
 
-        if self.async_collection:
-            self.collector.start()
-            while self.collector.getattr_rb("write_count") == 0:
-                time.sleep(0.1)
+        setup_complete = False
+        try:
+            if self.async_collection:
+                self.collector.start()
+                while self.collector.getattr_rb("write_count") == 0:
+                    time.sleep(0.1)
 
-            # Create async iterator that monitors write_count progress
-            iterator = self._async_iterator()
-        else:
-            iterator = self.collector
-
-        self._setup_hook()
-
-        for batch in iterator:
-            if not self.async_collection:
-                batch = self._process_batch_hook(batch)
-                current_frames = (
-                    batch.get(("collector", "mask"), torch.tensor(batch.numel()))
-                    .sum()
-                    .item()
-                    * self.frame_skip
-                )
-                self.collected_frames += current_frames
+                # Create async iterator that monitors write_count progress
+                iterator = self._async_iterator()
             else:
-                # In async mode, batch is None and we track frames via write_count
-                batch = None
-                cf = self.collected_frames
-                self.collected_frames = self.collector.getattr_rb("write_count")
-                current_frames = self.collected_frames - cf
+                iterator = self.collector
 
-            # LOGGING POINT 1: Pre-optimization logging (e.g., rewards, frame counts)
-            self._pre_steps_log_hook(batch)
+            self._setup_hook()
+            setup_complete = True
 
-            if self.collected_frames >= self.collector.init_random_frames:
-                self.optim_steps(batch)
-            self._post_steps_hook()
+            for batch in iterator:
+                if not self.async_collection and batch is not None:
+                    batch = self._process_batch_hook(batch)
+                    current_frames = (
+                        batch.get(("collector", "mask"), torch.tensor(batch.numel()))
+                        .sum()
+                        .item()
+                        * self.frame_skip
+                    )
+                    self.collected_frames += current_frames
+                else:
+                    # Batch is None: either async collection, or a synchronous
+                    # collector that writes directly to the replay buffer (e.g.
+                    # LLM collectors created with a replay_buffer). Frames are
+                    # tracked via the buffer write count in both cases.
+                    batch = None
+                    cf = self.collected_frames
+                    if self.replay_buffer is not None:
+                        self.collected_frames = self._replay_write_count()
+                    else:
+                        self.collected_frames = self.collector.getattr_rb("write_count")
+                    current_frames = self.collected_frames - cf
 
-            # LOGGING POINT 2: Post-optimization logging (e.g., validation rewards, evaluation metrics)
-            self._post_steps_log_hook(batch)
+                # LOGGING POINT 1: Pre-optimization logging (e.g., rewards, frame counts)
+                self._pre_steps_log_hook(batch)
 
-            if self._stop_training:
-                if self._stop_reason and VERBOSE:
-                    torchrl_logger.info(f"Trainer stopping early: {self._stop_reason}")
-                self.save_trainer(force_save=True)
-                break
+                if self.collected_frames >= self.collector.init_random_frames:
+                    self.optim_steps(batch)
+                self._post_steps_hook()
 
-            if self.progress_bar:
-                self._pbar.update(current_frames)
-                self._pbar_description()
+                # LOGGING POINT 2: Post-optimization logging (e.g., validation rewards, evaluation metrics)
+                self._post_steps_log_hook(batch)
 
-            if self.collected_frames >= self.total_frames:
-                self.save_trainer(force_save=True)
-                break
-            self.save_trainer()
+                if self._stop_training:
+                    if self._stop_reason and VERBOSE:
+                        torchrl_logger.info(
+                            f"Trainer stopping early: {self._stop_reason}"
+                        )
+                    self._save_trainer_at_boundary(force_save=True)
+                    break
 
-        self._shutdown_hook()
-        self.collector.shutdown()
+                if self.progress_bar:
+                    self._pbar.update(current_frames)
+                    self._pbar_description()
+
+                if self.collected_frames >= self.total_frames:
+                    self._save_trainer_at_boundary(force_save=True)
+                    break
+                self._save_trainer_at_boundary()
+        finally:
+            try:
+                if setup_complete:
+                    self._shutdown_hook()
+            finally:
+                self.collector.shutdown()
 
     def _train_with_execution_backend(self) -> None:
         """Run collection while the private backend owns optimization state."""
@@ -1552,12 +1920,7 @@ class Trainer:
     def _save_execution_checkpoint(
         self, *, force_save: bool = False, resume_collection: bool = True
     ) -> None:
-        if not self._has_checkpoint_destination():
-            return
-        if (
-            not force_save
-            and (self.collected_frames - self._last_save) <= self.save_trainer_interval
-        ):
+        if not self._save_due(force_save):
             return
         if self.async_collection:
             pause = getattr(self.collector, "pause", None)
@@ -2046,10 +2409,13 @@ class OptimizerHook(TrainerHookBase):
         return losses_td
 
     def state_dict(self) -> dict[str, Any]:
-        return {}
+        state_dict = getattr(self.optimizer, "state_dict", None)
+        return state_dict() if callable(state_dict) else {}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        pass
+        load_state_dict = getattr(self.optimizer, "load_state_dict", None)
+        if state_dict and callable(load_state_dict):
+            load_state_dict(state_dict)
 
     def register(self, trainer, name="optimizer") -> None:
         trainer.register_op("optimizer", self)
@@ -2696,10 +3062,10 @@ class UpdateWeights(TrainerHookBase):
     intervals. If the devices match, this will result in a no-op.
 
     Args:
-        collector (BaseCollector): A data collector where the policy weights
-            must be synced.
-        update_weights_interval (int): Interval (in terms of number of batches
-            collected) where the sync must take place.
+        collector (BaseCollector, optional): A data collector where the policy
+            weights must be synced. Not required when a ``sender`` is given.
+        update_weights_interval (int, optional): Interval where the sync must
+            take place, counted in units of ``interval_unit``. Default: ``1``.
         policy_weights_getter (Callable, optional): A callable that returns the policy
             weights to sync. Used for backward compatibility. If both this and
             weight_update_map are provided, weight_update_map takes precedence.
@@ -2707,7 +3073,22 @@ class UpdateWeights(TrainerHookBase):
             (keys in collector's weight_sync_schemes) to source paths on the trainer.
             Example: ``{"policy": "loss_module.actor_network", "replay_buffer.transforms[0]": "loss_module.critic_network"}``.
         trainer (Trainer, optional): The trainer instance, required when using
-            weight_update_map to resolve source paths.
+            weight_update_map to resolve source paths, or when
+            ``interval_unit="optim_steps"`` (to read the optimizer step count).
+
+    Keyword Args:
+        sender (optional): A weight-sync sender object exposing an
+            ``update_weights()`` method (e.g. the sender returned by a
+            :class:`~torchrl.weight_update.weight_sync_schemes.WeightSyncScheme`'s
+            ``create_sender()``). When provided, weights are pushed through the
+            sender instead of ``collector.update_policy_weights_()``. This is
+            used by LLM trainers whose inference engine (vLLM, SGLang) is fed
+            by a standalone sender.
+        interval_unit (str, optional): Unit of ``update_weights_interval``:
+            ``"batches"`` (default) counts collected batches and registers the
+            hook at the ``post_steps`` stage; ``"optim_steps"`` counts
+            optimizer steps and registers the hook at the ``post_optim`` stage,
+            enabling weight pushes in the middle of an optimization loop.
 
     Examples:
         >>> # Legacy usage with policy_weights_getter
@@ -2728,15 +3109,27 @@ class UpdateWeights(TrainerHookBase):
         ... )
         >>> trainer.register_op("post_steps", update_weights)
 
+        >>> # Sender-based usage with optimizer-step cadence (LLM trainers)
+        >>> update_weights = UpdateWeights(
+        ...     update_weights_interval=10,
+        ...     trainer=trainer,
+        ...     sender=sender,
+        ...     interval_unit="optim_steps",
+        ... )
+        >>> update_weights.register(trainer)
+
     """
 
     def __init__(
         self,
-        collector: BaseCollector,
-        update_weights_interval: int,
+        collector: BaseCollector | None = None,
+        update_weights_interval: int = 1,
         policy_weights_getter: Callable[[Any], Any] | None = None,
         weight_update_map: dict[str, str] | None = None,
         trainer: Trainer | None = None,
+        *,
+        sender: Any | None = None,
+        interval_unit: Literal["batches", "optim_steps"] = "batches",
     ):
         self.collector = collector
         self.update_weights_interval = update_weights_interval
@@ -2744,28 +3137,72 @@ class UpdateWeights(TrainerHookBase):
         self.policy_weights_getter = policy_weights_getter
         self.weight_update_map = weight_update_map
         self.trainer = trainer
+        self.sender = sender
+        self.interval_unit = interval_unit
+        self._last_update_count = 0
 
         # Validate inputs
+        if update_weights_interval < 1:
+            raise ValueError("update_weights_interval must be >= 1")
+        if interval_unit not in ("batches", "optim_steps"):
+            raise ValueError(
+                f"interval_unit must be 'batches' or 'optim_steps', got {interval_unit!r}"
+            )
+        if sender is None and collector is None:
+            raise ValueError("either a collector or a sender must be provided")
+        if sender is not None and (
+            policy_weights_getter is not None or weight_update_map is not None
+        ):
+            raise ValueError(
+                "sender is mutually exclusive with policy_weights_getter and "
+                "weight_update_map"
+            )
         if weight_update_map is not None and trainer is None:
             raise ValueError("trainer must be provided when using weight_update_map")
+        if interval_unit == "optim_steps" and trainer is None:
+            raise ValueError(
+                "trainer must be provided when interval_unit='optim_steps'"
+            )
+
+    def _optimizer_step_count(self) -> int:
+        """Read the optimizer step count from the trainer.
+
+        Prefers the stepper's ``optimizer_step_count`` (which discounts
+        gradient-accumulation micro-steps and skipped steps) and falls back to
+        the trainer's raw optimization-loop counter.
+        """
+        stepper = getattr(self.trainer, "optimization_stepper", None)
+        count = getattr(stepper, "optimizer_step_count", None)
+        if count is None:
+            count = self.trainer._optim_count
+        return count
 
     def __call__(self):
-        self.counter += 1
-        if self.counter % self.update_weights_interval == 0:
-            # New approach: use weight_update_map if provided
-            if self.weight_update_map is not None:
-                self._update_with_map()
-            # Legacy approach: use policy_weights_getter
+        if self.interval_unit == "optim_steps":
+            count = self._optimizer_step_count()
+            if count - self._last_update_count < self.update_weights_interval:
+                return
+            self._last_update_count = count
+        else:
+            self.counter += 1
+            if self.counter % self.update_weights_interval != 0:
+                return
+        if self.sender is not None:
+            self.sender.update_weights()
+        # New approach: use weight_update_map if provided
+        elif self.weight_update_map is not None:
+            self._update_with_map()
+        # Legacy approach: use policy_weights_getter
+        else:
+            weights = (
+                self.policy_weights_getter()
+                if self.policy_weights_getter is not None
+                else None
+            )
+            if weights is not None:
+                self.collector.update_policy_weights_(weights)
             else:
-                weights = (
-                    self.policy_weights_getter()
-                    if self.policy_weights_getter is not None
-                    else None
-                )
-                if weights is not None:
-                    self.collector.update_policy_weights_(weights)
-                else:
-                    self.collector.update_policy_weights_()
+                self.collector.update_policy_weights_()
 
     def _update_with_map(self):
         """Update weights using the weight_update_map."""
@@ -2796,17 +3233,24 @@ class UpdateWeights(TrainerHookBase):
         self.collector.update_policy_weights_(weights_dict=weights_dict)
 
     def register(self, trainer: Trainer, name: str = "update_weights"):
+        if self.trainer is None:
+            self.trainer = trainer
         trainer.register_module(name, self)
+        stage = "post_optim" if self.interval_unit == "optim_steps" else "post_steps"
         trainer.register_op(
-            "post_steps",
+            stage,
             self,
         )
 
     def state_dict(self) -> dict:
-        return {"counter": self.counter}
+        return {
+            "counter": self.counter,
+            "last_update_count": self._last_update_count,
+        }
 
     def load_state_dict(self, state_dict) -> None:
         self.counter = state_dict.get("counter", 0)
+        self._last_update_count = state_dict.get("last_update_count", 0)
 
 
 class CountFramesLog(TrainerHookBase):

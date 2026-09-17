@@ -323,7 +323,11 @@ A family of MuJoCo-backed envs sharing one base class
 native-torch engine, ``"mjx"`` -- JAX-vectorized, or ``"mujoco"`` --
 official C-bindings). For envs with a standalone XML asset, the XML can be a
 local path or an ``http(s)`` URL, so users can point at remote models without
-vendoring them. Subclasses describe the *task* by overriding
+vendoring them. Pass ``patch_xml=False`` for directory-based local models that
+use relative ``<include>`` entries, meshes, textures, or other assets; the
+model path is then preserved across all three backends so MuJoCo resolves
+resources relative to its directory. Subclasses describe the *task* by
+overriding
 :meth:`~torchrl.envs.MujocoEnv._compute_reward` and
 :meth:`~torchrl.envs.MujocoEnv._compute_done`.
 
@@ -335,6 +339,26 @@ internal singular configurations of the gimbal Jacobian.
 :class:`~torchrl.envs.CubeBowlEnv` is a compact
 manipulation task for scripted MuJoCo macro-control examples. It composes a
 local MuJoCo Menagerie UR5e + Robotiq 2F-85 scene.
+:class:`~torchrl.envs.MicroDuckEnv` is a commanded-velocity locomotion task
+for Pollen Robotics' MicroDuck biped. It loads the walking MJCF from a local
+``microduck_rl`` checkout (``MICRODUCK_RL_ROOT``), an installed
+``mjlab_microduck`` package, or a pinned upstream commit downloaded on demand
+with ``download=True``, replaces the heavy collision meshes with box
+proxies so the accelerated backends fit in memory, and exposes foot contacts
+and foot heights for gait metrics through
+:meth:`~torchrl.envs.MujocoEnv.geom_contacts` and
+:meth:`~torchrl.envs.MujocoEnv.site_positions`.
+A task is data: :class:`~torchrl.envs.MicroDuckTask` is a tensorclass
+holding the command box, the reset distribution, the gait clock and the
+reward weights and parameters, built with presets such as
+:meth:`~torchrl.envs.MicroDuckEnv.speed_range_task`,
+:meth:`~torchrl.envs.MicroDuckEnv.sidestep_task` and
+:meth:`~torchrl.envs.MicroDuckEnv.jump_task`. The env takes a stacked library
+of tasks and every env of the batch holds one row of it, picked at reset from
+the tasks' weights or from a ``task_id`` in the reset TensorDict;
+:class:`~torchrl.envs.MicroDuckTaskSampler` writes that id from a mixture of
+its own. The reward is a registry of terms over shared step features that
+:meth:`~torchrl.envs.MicroDuckEnv.register_reward` extends.
 
 MuJoCo env batches can be indexed with integers, slices, integer NumPy arrays,
 and integer torch tensors. Indexing returns a detached snapshot, not a live
@@ -351,6 +375,9 @@ state into the parent batch. Boolean masks are not supported.
     CubeBowlEnv
     HopperEnv
     HumanoidEnv
+    MicroDuckEnv
+    MicroDuckTask
+    MicroDuckTaskSampler
     SatelliteEnv
     Walker2dEnv
 

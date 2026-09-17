@@ -29,6 +29,11 @@ By default, the transformed environment will inherit the device of the
 It is now apparent that this can bring a significant speedup depending on the kind of
 operations that is to be computed.
 
+:attr:`Tokenizer.out_device` describes the destination of token tensors and
+attention masks. It follows the current parent environment device; ``None``
+leaves outputs on the tokenizer's chosen device. ``Tokenizer.device`` is a
+deprecated alias and will be removed in TorchRL v0.17.
+
 A great advantage of environment wrappers is that one can consult the environment up to that wrapper.
 The same can be achieved with TorchRL transformed environments: the ``parent`` attribute will
 return a new :class:`TransformedEnv` with all the transforms up to the transform of interest.
@@ -267,6 +272,7 @@ Available Transforms
     DecodeVideoTransform
     DeviceCastTransform
     DiscreteActionProjection
+    DoneTransform
     DoubleToFloat
     EndOfLifeTransform
     ExcludeTransform
@@ -279,6 +285,7 @@ Available Transforms
     Hash
     HumanoidMacroAction
     InitTracker
+    LastAction
     LineariseRewards
     MacroAction
     MacroPrimitive
@@ -296,6 +303,7 @@ Available Transforms
     NextObservationDelta
     NextStateReconstructor
     PolicyAgeFilter
+    PolicyVersion
     NoopResetEnv
     ObservationNorm
     ObservationTransform

@@ -7,20 +7,38 @@ from __future__ import annotations
 import argparse
 import copy
 import functools as ft
+import importlib.util
+import sys
 from unittest import mock
 
 import pytest
 import torch
 from packaging import version
+from pyvers import implement_for
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule
+from tensordict.nn import CudaGraphModule, TensorDictModule
+from torch.nn import functional as F
+from torchrl.checkpoint import Checkpoint
 from torchrl.data.tensor_specs import Bounded
-from torchrl.modules import SafeModule
+from torchrl.envs import ExplorationType, set_exploration_type
+from torchrl.modules import (
+    DreamerV3DiscreteActor,
+    DreamerV3SeededPolicy,
+    RSSMStateEstimatorV3,
+    SafeModule,
+)
+from torchrl.modules.models._dreamer_v3_block_gru_triton import (
+    _has_triton as _has_dreamer_v3_triton,
+)
 from torchrl.modules.models.model_based import (
     _DreamerV3BlockLinear,
     _DreamerV3RMSNorm,
     _straight_through_categorical,
     DreamerActor,
+    DreamerV3BlockGRU,
+    DreamerV3BlockGRUCell,
+    DreamerV3ImageDecoder,
+    DreamerV3ImageEncoder,
     DreamerV3MLP,
     ObsDecoder,
     ObsEncoder,
@@ -32,6 +50,11 @@ from torchrl.modules.models.model_based import (
     RSSMRolloutV3,
 )
 from torchrl.testing import get_default_devices
+from torchrl.trainers.algorithms import DreamerV3UpdateRatio
+
+
+_has_hoptorch = importlib.util.find_spec("hoptorch") is not None
+_compile_backend = "eager" if sys.platform == "win32" else "inductor"
 
 
 @pytest.mark.parametrize("device", get_default_devices())
@@ -270,6 +293,87 @@ class TestDreamerComponents:
 
 
 class TestDreamerV3Components:
+    @pytest.mark.parametrize(
+        "execution",
+        [
+            "eager",
+            "compile",
+            pytest.param(
+                "cudagraph",
+                marks=[
+                    pytest.mark.gpu,
+                    pytest.mark.skipif(
+                        not torch.cuda.is_available(), reason="requires CUDA"
+                    ),
+                ],
+            ),
+        ],
+    )
+    def test_state_estimator_resets_and_posterior_rng(self, execution):
+        device = torch.device("cuda" if execution == "cudagraph" else "cpu")
+        rollout = self._make_rollout(device)
+        prior, posterior = rollout.rssm_prior.module, rollout.rssm_posterior.module
+        keys = [
+            ("context", key)
+            for key in ("state", "belief", "action", "embedding", "reset")
+        ]
+        outputs = [("current", "state"), ("current", "belief")]
+        estimator = RSSMStateEstimatorV3(
+            prior, posterior, in_keys=keys, out_keys=outputs
+        )
+        state, belief = torch.randn(2, 3, 8, device=device), torch.randn(
+            2, 3, 8, device=device
+        )
+        action = torch.randint(2, (2, 3, 2), device=device).bool()
+        embedding = torch.randn(2, 3, 6, device=device)
+        reset = torch.tensor(
+            [[True, False, False], [False, True, False]], device=device
+        )
+        sample = TensorDict(
+            dict(zip(keys, (state, belief, action, embedding, reset))),
+            [2, 3],
+            device=device,
+        )
+        call = estimator
+        if execution == "compile":
+            call = torch.compile(estimator, backend="eager", fullgraph=True)
+        elif execution == "cudagraph":
+            call = CudaGraphModule(estimator, warmup=3, device=device)
+        with torch.no_grad(), torch.autocast(
+            device.type, dtype=torch.bfloat16, enabled=execution == "cudagraph"
+        ):
+            for _ in range(3):
+                call(sample.clone())
+            # A supplied uniform avoids a discarded prior draw. Only the
+            # posterior may advance the acting random stream.
+            _, _, expected_belief = prior(
+                state.masked_fill(reset.unsqueeze(-1), 0),
+                belief.masked_fill(reset.unsqueeze(-1), 0),
+                action.masked_fill(reset.unsqueeze(-1), 0),
+                _uniform=torch.zeros(2, 3, 2, device=device),
+            )
+            torch.manual_seed(17)
+            _, expected_state = posterior(expected_belief, embedding)
+            expected_rng = torch.rand(4, device=device)
+            torch.manual_seed(17)
+            result = call(sample.clone())
+            torch.testing.assert_close(result[outputs[0]], expected_state)
+            torch.testing.assert_close(result[outputs[1]], expected_belief.float())
+            torch.testing.assert_close(torch.rand(4, device=device), expected_rng)
+            # Refresh shared parameters in place, then exercise a different
+            # reset mask without replacing captured parameter storage.
+            for parameter in prior.parameters():
+                parameter.add_(0.1)
+            changed = sample.clone()
+            changed[keys[-1]] = ~reset
+            torch.manual_seed(23)
+            expected = estimator(changed.clone())
+            torch.manual_seed(23)
+            actual = call(changed.clone())
+            torch.testing.assert_close(actual[outputs[0]], expected[outputs[0]])
+            torch.testing.assert_close(actual[outputs[1]], expected[outputs[1]])
+            assert not torch.allclose(actual[outputs[1]], expected_belief.float())
+
     def test_reference_normalization_and_block_fan_in(self):
         norm = _DreamerV3RMSNorm(8)
         assert set(dict(norm.named_parameters())) == {"weight"}
@@ -343,6 +447,157 @@ class TestDreamerV3Components:
             [2, 4],
         )
 
+    @pytest.mark.parametrize(
+        ("device", "execution"),
+        [
+            ("cpu", "eager"),
+            ("cpu", "compile"),
+            ("cpu", "autocast"),
+            pytest.param(
+                "cuda",
+                "autocast",
+                marks=[
+                    pytest.mark.gpu,
+                    pytest.mark.skipif(
+                        not torch.cuda.is_available(), reason="requires CUDA"
+                    ),
+                ],
+            ),
+        ],
+    )
+    def test_discrete_actor(self, device, execution):
+        actor = DreamerV3DiscreteActor(
+            12,
+            5,
+            depth=2,
+            num_cells=16,
+            unimix=0.2,
+            device=device,
+            in_keys=[("latent", "state"), ("latent", "belief")],
+            action_key=("policy", "action"),
+            logits_key=("policy", "logits"),
+            log_prob_key=("policy", "log_prob"),
+        )
+        unmixed = DreamerV3DiscreteActor(
+            12, 5, depth=2, num_cells=16, unimix=0, device=device
+        )
+        unmixed.load_state_dict(actor.state_dict())
+        data = TensorDict(
+            {
+                "state": torch.randn(2, 3, 8, device=device),
+                "belief": torch.randn(2, 3, 4, device=device),
+            },
+            [2, 3],
+        )
+        nested = TensorDict({"latent": data}, [2, 3])
+        get_dist = (
+            torch.compile(actor.get_dist, backend="eager", fullgraph=True)
+            if execution == "compile"
+            else actor.get_dist
+        )
+        with torch.autocast(
+            device, dtype=torch.bfloat16, enabled=execution == "autocast"
+        ):
+            expected = 0.8 * unmixed.get_dist(data.clone()).probs + 0.2 / 5
+            distribution = get_dist(nested.clone())
+            torch.testing.assert_close(
+                distribution.probs, expected, rtol=1e-6, atol=1e-7
+            )
+            assert distribution.logits.dtype == torch.float32
+            with set_exploration_type(ExplorationType.DETERMINISTIC):
+                result = actor(nested.clone())
+            torch.testing.assert_close(
+                result["policy", "action"],
+                F.one_hot(expected.argmax(-1), 5).to(result["policy", "action"]),
+            )
+            with set_exploration_type(ExplorationType.RANDOM):
+                result = actor(nested.clone())
+            action = result["policy", "action"]
+            assert ((action == 0) | (action == 1)).all() and (action.sum(-1) == 1).all()
+            torch.testing.assert_close(
+                result["policy", "log_prob"], distribution.log_prob(action)
+            )
+            before = {
+                name: value.detach().clone() for name, value in actor.named_parameters()
+            }
+            optimizer = torch.optim.SGD(actor.parameters(), lr=0.1)
+            sampled = distribution.rsample()
+            torch.testing.assert_close(
+                sampled.detach().sum(-1), torch.ones(2, 3, device=device)
+            )
+            (sampled * torch.arange(5, device=device)).sum().backward()
+            optimizer.step()
+            assert any(
+                not torch.equal(before[name], value)
+                for name, value in actor.named_parameters()
+            )
+
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "mps",
+                marks=pytest.mark.skipif(
+                    not torch.backends.mps.is_available(), reason="needs MPS"
+                ),
+            ),
+            pytest.param(
+                "cuda",
+                marks=[
+                    pytest.mark.gpu,
+                    pytest.mark.skipif(
+                        not torch.cuda.is_available(), reason="needs CUDA"
+                    ),
+                ],
+            ),
+        ],
+    )
+    def test_policy_rng_and_update_ratio_checkpoint(self, tmp_path, device):
+        policy = DreamerV3SeededPolicy(
+            DreamerV3DiscreteActor(
+                6,
+                5,
+                depth=1,
+                num_cells=8,
+                in_keys=[("latent", "state"), ("latent", "belief")],
+            ),
+            seed=17,
+        ).to(device)
+        data = TensorDict(
+            {
+                ("latent", "state"): torch.randn(12, 4, device=device),
+                ("latent", "belief"): torch.randn(12, 2, device=device),
+            },
+            [12],
+        )
+        schedule = DreamerV3UpdateRatio(0.25)
+        assert schedule(4) == 1 and schedule(6) == 0
+        policy(data.clone())
+        checkpoint = Checkpoint(policy=policy, schedule=schedule)
+        checkpoint.save(tmp_path / "saved")
+        caller_rng = torch.random.get_rng_state().clone()
+        accelerator_rngs = [
+            (torch.cuda, index) for index in range(torch.cuda.device_count())
+        ]
+        if torch.backends.mps.is_available():
+            accelerator_rngs.append((torch.mps, "mps"))
+        caller_accelerator_rngs = [
+            backend.get_rng_state(index).clone() for backend, index in accelerator_rngs
+        ]
+        expected = [policy(data.clone())["action"] for _ in range(3)]
+        assert torch.equal(torch.random.get_rng_state(), caller_rng)
+        for (backend, index), state in zip(accelerator_rngs, caller_accelerator_rngs):
+            assert torch.equal(backend.get_rng_state(index), state)
+        updates = [schedule(i) for i in (8, 10, 15)]
+        policy.reset_counter()
+        checkpoint.load(tmp_path / "saved")
+        for action in expected:
+            torch.testing.assert_close(policy(data.clone())["action"], action)
+        assert [schedule(i) for i in (8, 10, 15)] == updates == [1, 0, 1]
+        schedule.reset(100)
+        assert schedule(102) == 0 and schedule(104) == 1
+
     def test_mlp_output_scale_and_multiple_inputs(self):
         module = DreamerV3MLP(
             6,
@@ -353,6 +608,42 @@ class TestDreamerV3Components:
         )
         output = module(torch.randn(3, 2), torch.randn(3, 4))
         torch.testing.assert_close(output, torch.zeros_like(output))
+
+    @pytest.mark.parametrize("device", get_default_devices())
+    @pytest.mark.parametrize("num_blocks", [1, 2])
+    def test_image_encoder_decoder(self, device, num_blocks):
+        encoder = DreamerV3ImageEncoder(
+            depth=4, mults=(1, 2), kernel_size=5, device=device
+        )
+        image = torch.randint(
+            0, 256, (2, 3, 3, 16, 16), dtype=torch.uint8, device=device
+        )
+        features = encoder(image)
+        # Two stride-2 stages: 16x16 -> 4x4 with 4 * 2 channels.
+        assert encoder.output_features((3, 16, 16)) == 8 * 4 * 4
+        assert features.shape == (2, 3, 128)
+        # uint8 and [0, 1] float inputs are the same image.
+        torch.testing.assert_close(features, encoder(image.float() / 255.0))
+
+        decoder = DreamerV3ImageDecoder(
+            in_features=6 + 10,
+            image_shape=(3, 16, 16),
+            depth=4,
+            mults=(1, 2),
+            kernel_size=5,
+            num_blocks=num_blocks,
+            device=device,
+        )
+        state = torch.randn(2, 3, 6, device=device, requires_grad=True)
+        belief = torch.randn(2, 3, 10, device=device)
+        reco = decoder(state, belief)
+        assert reco.shape == (2, 3, 3, 16, 16)
+        reco.sum().backward()
+        assert state.grad.abs().sum() > 0
+        with pytest.raises(ValueError, match="divisible"):
+            DreamerV3ImageDecoder(
+                in_features=16, image_shape=(3, 12, 16), mults=(1, 2, 3)
+            )
 
     @pytest.mark.parametrize("device", get_default_devices())
     def test_block_gru_reference_fixture(self, device):
@@ -405,6 +696,214 @@ class TestDreamerV3Components:
         )
         assert sampled_state.shape == (1, 4)
 
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.7.0"),
+        reason="hoptorch requires torch >= 2.7.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
+    @pytest.mark.parametrize("device", get_default_devices())
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(("num_blocks", "batch", "time"), [(1, 1, 1), (8, 3, 5)])
+    def test_public_block_gru_sequence_forward_parity(
+        self, device, dtype, num_blocks, batch, time
+    ):
+        torch.manual_seed(0)
+        kwargs = {
+            "input_size": 6,
+            "hidden_size": 8,
+            "projection_size": 4,
+            "num_blocks": num_blocks,
+            "num_layers": 2,
+            "activation_class": torch.nn.Tanh if num_blocks == 1 else torch.nn.SiLU,
+            "device": device,
+        }
+        reference = DreamerV3BlockGRU(**kwargs)
+        scan = DreamerV3BlockGRU(**kwargs, recurrent_backend="scan")
+        scan.load_state_dict(reference.state_dict())
+        cell = DreamerV3BlockGRUCell(**kwargs)
+        cell.load_state_dict(reference.cell.state_dict())
+        value = torch.randn(batch, time, 6, device=device, dtype=dtype)
+        initial = torch.randn(batch, 8, device=device, dtype=dtype)
+        is_init = torch.zeros(batch, time, 1, device=device, dtype=torch.bool)
+        if time > 1:
+            is_init[0, 2] = True
+            is_init[-1, 0] = True
+
+        expected, expected_final = reference(value, initial, is_init)
+        actual, actual_final = scan(value, initial, is_init)
+
+        hidden = initial
+        cell_outputs = []
+        for value_t, init_t in zip(value.unbind(1), is_init.unbind(1)):
+            hidden = torch.where(init_t, 0, hidden)
+            hidden = cell(value_t, hidden)
+            cell_outputs.append(hidden)
+        cell_output = torch.stack(cell_outputs, 1)
+
+        tolerance = {"atol": 2e-2, "rtol": 2e-2} if dtype is torch.bfloat16 else {}
+        torch.testing.assert_close(actual, expected, **tolerance)
+        torch.testing.assert_close(actual_final, expected_final, **tolerance)
+        torch.testing.assert_close(cell_output, expected, **tolerance)
+        if time == 1:
+            default_output, default_final = reference(value)
+            zero_output, zero_final = reference(
+                value, torch.zeros_like(initial), torch.zeros_like(is_init)
+            )
+            torch.testing.assert_close(default_output, zero_output, **tolerance)
+            torch.testing.assert_close(default_final, zero_final, **tolerance)
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.7.0"),
+        reason="hoptorch requires torch >= 2.7.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
+    @pytest.mark.parametrize("device", get_default_devices())
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("num_blocks", [1, 8])
+    def test_public_block_gru_sequence_gradient_parity(self, device, dtype, num_blocks):
+        torch.manual_seed(1)
+        kwargs = {
+            "input_size": 6,
+            "hidden_size": 8,
+            "projection_size": 4,
+            "num_blocks": num_blocks,
+            "num_layers": 2,
+            "activation_class": torch.nn.Tanh if num_blocks == 1 else torch.nn.SiLU,
+            "device": device,
+        }
+        reference = DreamerV3BlockGRU(**kwargs)
+        scan = DreamerV3BlockGRU(**kwargs, recurrent_backend="scan")
+        scan.load_state_dict(reference.state_dict())
+        value_source = torch.randn(3, 5, 6, device=device, dtype=dtype)
+        hidden_source = torch.randn(3, 8, device=device, dtype=dtype)
+        is_init = torch.tensor(
+            [
+                [False, False, True, False, False],
+                [True, False, False, False, True],
+                [False, False, False, False, False],
+            ],
+            device=device,
+        )
+        output_cotangent = torch.randn(3, 5, 8, device=device, dtype=dtype) / (
+            3 * 5 * 8
+        )
+        hidden_cotangent = torch.randn(3, 8, device=device, dtype=dtype) / (3 * 8)
+
+        def run(module):
+            value = value_source.detach().clone().requires_grad_()
+            hidden = hidden_source.detach().clone().requires_grad_()
+            output, final_hidden = module(value, hidden, is_init)
+            loss = (output * output_cotangent).float().sum() + (
+                final_hidden * hidden_cotangent
+            ).float().sum()
+            loss.backward()
+            return (
+                output.detach(),
+                final_hidden.detach(),
+                value.grad,
+                hidden.grad,
+                {name: parameter.grad for name, parameter in module.named_parameters()},
+            )
+
+        expected = run(reference)
+        actual = run(scan)
+        tolerance = (
+            {"atol": 3e-2, "rtol": 5e-2}
+            if dtype is torch.bfloat16
+            else {"atol": 2e-5, "rtol": 2e-5}
+        )
+        for expected_value, actual_value in zip(expected[:4], actual[:4]):
+            torch.testing.assert_close(actual_value, expected_value, **tolerance)
+        assert actual[4].keys() == expected[4].keys()
+        for name in expected[4]:
+            torch.testing.assert_close(actual[4][name], expected[4][name], **tolerance)
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.7.0"),
+        reason="hoptorch requires torch >= 2.7.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
+    def test_public_block_gru_scan_compile_recurrent_loss(self):
+        module = DreamerV3BlockGRU(
+            6,
+            8,
+            projection_size=4,
+            num_blocks=2,
+            num_layers=2,
+            recurrent_backend="scan",
+        )
+        compiled = torch.compile(module, backend=_compile_backend, fullgraph=True)
+        value = torch.randn(2, 5, 6, requires_grad=True)
+        hidden = torch.randn(2, 8, requires_grad=True)
+        is_init = torch.tensor(
+            [[False, False, True, False, False], [True, False, False, False, True]]
+        )
+
+        output, final_hidden = compiled(value, hidden, is_init)
+        prediction = output[:, :-1, :6]
+        target = value.detach()[:, 1:]
+        loss = (
+            F.smooth_l1_loss(prediction, target) + 0.01 * final_hidden.square().mean()
+        )
+        loss.backward()
+
+        assert value.grad is not None
+        assert hidden.grad is not None
+        assert all(parameter.grad is not None for parameter in module.parameters())
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.7.0"),
+        reason="hoptorch requires torch >= 2.7.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
+    def test_public_block_gru_scan_double_backward_raises(self):
+        torch.manual_seed(0)
+        module = DreamerV3BlockGRU(
+            6,
+            8,
+            projection_size=4,
+            num_blocks=2,
+            recurrent_backend="scan",
+        )
+        value = torch.randn(2, 5, 6, requires_grad=True)
+        is_init = torch.zeros(2, 5, dtype=torch.bool)
+        output, _ = module(value, torch.zeros(2, 8), is_init)
+        cotangent = torch.randn_like(output).requires_grad_()
+        (grad,) = torch.autograd.grad(
+            output, value, grad_outputs=cotangent, create_graph=True
+        )
+        with pytest.raises(
+            RuntimeError, match="differentiate twice|does not require grad"
+        ):
+            grad.sum().backward()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.7.0"),
+        reason="hoptorch requires torch >= 2.7.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
+    def test_public_block_gru_scan_mixed_dtype_promotes(self):
+        torch.manual_seed(0)
+        kwargs = {
+            "input_size": 6,
+            "hidden_size": 8,
+            "projection_size": 4,
+            "num_blocks": 2,
+        }
+        reference = DreamerV3BlockGRU(**kwargs)
+        scan_module = DreamerV3BlockGRU(**kwargs, recurrent_backend="scan")
+        scan_module.load_state_dict(reference.state_dict())
+        value = torch.randn(2, 5, 6, dtype=torch.bfloat16)
+        hidden = torch.randn(2, 8)
+        is_init = torch.zeros(2, 5, dtype=torch.bool)
+        is_init[1, 2] = True
+        expected_output, expected_hidden = reference(value, hidden, is_init)
+        output, final_hidden = scan_module(value, hidden, is_init)
+        assert output.dtype == expected_output.dtype
+        assert final_hidden.dtype == expected_hidden.dtype
+        torch.testing.assert_close(output, expected_output, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(final_hidden, expected_hidden, atol=2e-5, rtol=2e-5)
+
     @pytest.mark.parametrize("device", get_default_devices())
     def test_block_gru_action_normalization_and_gradients(self, device):
         prior = RSSMPriorV3(
@@ -437,6 +936,31 @@ class TestDreamerV3Components:
         assert belief.grad is not None
         assert all(parameter.grad is not None for parameter in prior.parameters())
 
+    @pytest.mark.parametrize("action_dtype", [torch.bool, torch.int64])
+    @pytest.mark.parametrize("recurrent_model", ["gru", "block_gru"])
+    def test_prior_nonfloating_actions(self, action_dtype, recurrent_model):
+        prior = RSSMPriorV3(
+            action_shape=(2,),
+            hidden_dim=8,
+            rnn_hidden_dim=8,
+            num_categoricals=2,
+            num_classes=4,
+            action_dim=2,
+            recurrent_model=recurrent_model,
+            num_blocks=2,
+        )
+        state = torch.randn(3, 8)
+        belief = torch.randn(3, 8)
+        action = torch.tensor([[0, 1], [1, 0], [0, 1]], dtype=action_dtype)
+        expected_logits, _, expected_belief = prior(state, belief, action.float())
+        logits, _, next_belief = prior(state, belief, action)
+        torch.testing.assert_close(logits, expected_logits)
+        torch.testing.assert_close(next_belief, expected_belief)
+        # Acting skips prior sampling and calls the deterministic update directly.
+        torch.testing.assert_close(
+            prior._update_belief(state, belief, action), expected_belief
+        )
+
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse("2.4.0"),
         reason="the native RMSNorm compile path requires Torch >= 2.4.0",
@@ -456,7 +980,7 @@ class TestDreamerV3Components:
         belief = torch.randn(3, 8)
         action = torch.randn(3, 2)
         uniform = torch.rand(3, 2)
-        compiled = torch.compile(prior, fullgraph=True)
+        compiled = torch.compile(prior, backend=_compile_backend, fullgraph=True)
 
         expected = prior(state, belief, action, _uniform=uniform)
         actual = compiled(state, belief, action, _uniform=uniform)
@@ -587,7 +1111,13 @@ class TestDreamerV3Components:
 
     @pytest.mark.parametrize("device", get_default_devices())
     @pytest.mark.parametrize("unroll", [1, 3, 8])
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.6.0"),
+        reason="the higher-order scan backend requires Torch >= 2.6.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
     def test_rssm_rollout_higher_order_scan_matches_loop(self, device, unroll):
+        torch.manual_seed(0)
         scan_rollout = self._make_rollout(device)
         loop_rollout = copy.deepcopy(scan_rollout)
         scan_rollout._scan_fn = ft.partial(scan_rollout._scan, unroll=unroll)
@@ -614,15 +1144,28 @@ class TestDreamerV3Components:
             loop_loss, tuple(loop_rollout.parameters())
         )
         for scan_gradient, loop_gradient in zip(scan_gradients, loop_gradients):
+            # The scan backend may accumulate float32 gradients in a different
+            # order from the Python loop.
             torch.testing.assert_close(
-                scan_gradient, loop_gradient, atol=2e-4, rtol=5e-5
+                scan_gradient, loop_gradient, atol=2e-4, rtol=1e-3
             )
 
-    @pytest.mark.parametrize("scope", ["step", "scan"])
-    def test_rssm_rollout_compile(self, scope):
+    @implement_for("torch", None, "2.6.0", compilable=True)
+    @pytest.mark.parametrize(("scope", "unroll"), [("step", 1)])
+    def test_rssm_rollout_compile(self, scope, unroll):
+        self._test_rssm_rollout_compile(scope, unroll)
+
+    @implement_for("torch", "2.6.0", compilable=True)
+    @pytest.mark.parametrize(
+        ("scope", "unroll"), [("step", 1), ("scan", 1), ("scan", 3)]
+    )
+    def test_rssm_rollout_compile(self, scope, unroll):  # noqa: F811
+        self._test_rssm_rollout_compile(scope, unroll)
+
+    def _test_rssm_rollout_compile(self, scope, unroll):
         rollout = self._make_rollout(torch.device("cpu"))
         data = self._make_rollout_data(torch.device("cpu"))
-        rollout.compile_rollout(scope, unroll=3 if scope == "scan" else 1)
+        rollout.compile_rollout(scope, unroll=unroll, backend=_compile_backend)
 
         output = rollout(data)
         (
@@ -630,6 +1173,318 @@ class TestDreamerV3Components:
             + output["next", "prior_logits"].square().mean()
         ).backward()
         assert all(parameter.grad is not None for parameter in rollout.parameters())
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.6.0"),
+        reason="the higher-order scan backend requires Torch >= 2.6.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
+    def test_rssm_rollout_scan_backend_inside_outer_compile(self):
+        """``compile=False`` selects the scan for an enclosing compiled region."""
+        rollout = self._make_rollout(torch.device("cpu"))
+        rollout.compile_rollout("scan", unroll=2, compile=False)
+        assert isinstance(rollout._scan_fn, ft.partial)
+        assert rollout._scan_fn.keywords == {"unroll": 2}
+
+        data = self._make_rollout_data(torch.device("cpu"))
+        compiled = torch.compile(rollout, backend=_compile_backend)
+        output = compiled(data)
+        (
+            output["next", "posterior_logits"].square().mean()
+            + output["next", "prior_logits"].square().mean()
+        ).backward()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.7.0"),
+        reason="hoptorch requires torch >= 2.7.0",
+    )
+    @pytest.mark.skipif(not _has_hoptorch, reason="hoptorch is not installed")
+    def test_rssm_rollout_scan_under_outer_compile_with_autocast(self):
+        rollout = self._make_rollout(torch.device("cpu"))
+        data = self._make_rollout_data(torch.device("cpu"))
+        rollout.compile_rollout("scan", unroll=2, backend=_compile_backend)
+
+        def loss(tensordict):
+            output = rollout(tensordict)
+            return (
+                output["next", "posterior_logits"].float().square().mean()
+                + output["next", "belief"].float().square().mean()
+            )
+
+        compiled_loss = torch.compile(loss, backend=_compile_backend, dynamic=False)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            value = compiled_loss(data)
+        value.backward()
+        assert torch.isfinite(value)
+        assert all(parameter.grad is not None for parameter in rollout.parameters())
+
+
+def test_public_block_gru_triton_errors():
+    with mock.patch("torchrl.modules.models.model_based._has_dreamer_v3_triton", False):
+        with pytest.raises(RuntimeError, match="requires Triton"):
+            DreamerV3BlockGRU(6, 8, recurrent_backend="triton")
+
+    class CustomActivation(torch.nn.Module):
+        def forward(self, value):
+            return value.sigmoid()
+
+    with mock.patch("torchrl.modules.models.model_based._has_dreamer_v3_triton", True):
+        with pytest.raises(ValueError, match="supports nn.SiLU, nn.Tanh, and nn.ReLU"):
+            DreamerV3BlockGRU(
+                6,
+                8,
+                projection_size=4,
+                num_blocks=2,
+                activation_class=CustomActivation,
+                recurrent_backend="triton",
+            )
+
+    with (
+        mock.patch("torchrl.modules.models.model_based._has_dreamer_v3_triton", True),
+        mock.patch(
+            "torchrl.modules.models._dreamer_v3_block_gru_triton._has_triton", True
+        ),
+    ):
+        module = DreamerV3BlockGRU(
+            6,
+            8,
+            projection_size=4,
+            num_blocks=2,
+            recurrent_backend="triton",
+        )
+        with pytest.raises(RuntimeError, match="requires CUDA tensors"):
+            module(torch.randn(2, 3, 6))
+        with pytest.raises(
+            ValueError, match="supports torch.float32 and torch.bfloat16"
+        ):
+            module(
+                torch.randn(2, 3, 6, dtype=torch.float64),
+                torch.zeros(2, 8, dtype=torch.float64),
+            )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_dreamer_v3_triton,
+    reason="DreamerV3 Triton backend requires CUDA and Triton 3.3+",
+)
+@pytest.mark.parametrize(
+    (
+        "activation_class",
+        "num_blocks",
+        "num_layers",
+        "batch",
+        "time",
+        "dtype",
+        "projection_size",
+    ),
+    [
+        (torch.nn.SiLU, 1, 1, 1, 1, torch.float32, 32),
+        (torch.nn.Tanh, 8, 2, 2, 3, torch.float32, 24),
+        (torch.nn.ReLU, 8, 1, 3, 2, torch.bfloat16, 32),
+        (torch.nn.SiLU, 8, 2, 2, 3, torch.bfloat16, 24),
+        (torch.nn.SiLU, 4, 1, 2, 3, torch.float32, 48),
+    ],
+)
+def test_public_block_gru_triton_gradient_parity(
+    activation_class, num_blocks, num_layers, batch, time, dtype, projection_size
+):
+    torch.manual_seed(0)
+    kwargs = {
+        "input_size": 12,
+        "hidden_size": 32,
+        "projection_size": projection_size,
+        "num_blocks": num_blocks,
+        "num_layers": num_layers,
+        "activation_class": activation_class,
+        "device": "cuda",
+    }
+    reference = DreamerV3BlockGRU(**kwargs)
+    triton_module = DreamerV3BlockGRU(**kwargs, recurrent_backend="triton")
+    triton_module.load_state_dict(reference.state_dict())
+    value_source = torch.randn(batch, time, 12, device="cuda", dtype=dtype)
+    hidden_source = torch.randn(batch, 32, device="cuda", dtype=dtype)
+    is_init = torch.zeros(batch, time, dtype=torch.bool, device="cuda")
+    if time > 1:
+        is_init[0, 1] = True
+        is_init[-1, 0] = True
+    output_cotangent = torch.randn(batch, time, 32, device="cuda", dtype=dtype) / (
+        batch * time * 32
+    )
+    hidden_cotangent = torch.randn(batch, 32, device="cuda", dtype=dtype) / (batch * 32)
+
+    def run(module):
+        module.zero_grad(set_to_none=True)
+        value = value_source.detach().clone().requires_grad_()
+        hidden = hidden_source.detach().clone().requires_grad_()
+        output, final_hidden = module(value, hidden, is_init)
+        loss = (output * output_cotangent).float().sum() + (
+            final_hidden * hidden_cotangent
+        ).float().sum()
+        loss.backward()
+        return (
+            output.detach(),
+            final_hidden.detach(),
+            value.grad,
+            hidden.grad,
+            {name: parameter.grad for name, parameter in module.named_parameters()},
+        )
+
+    expected = run(reference)
+    tolerance = (
+        {"atol": 4e-2, "rtol": 6e-2}
+        if dtype is torch.bfloat16
+        else {"atol": 3e-4, "rtol": 3e-4}
+    )
+    for _ in range(3):
+        actual = run(triton_module)
+        for expected_value, actual_value in zip(expected[:4], actual[:4]):
+            torch.testing.assert_close(actual_value, expected_value, **tolerance)
+        assert actual[4].keys() == expected[4].keys()
+        for name in expected[4]:
+            torch.testing.assert_close(actual[4][name], expected[4][name], **tolerance)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_dreamer_v3_triton,
+    reason="DreamerV3 Triton backend requires CUDA and Triton 3.3+",
+)
+def test_public_block_gru_triton_frozen_parameter_gradients():
+    torch.manual_seed(0)
+    kwargs = {
+        "input_size": 12,
+        "hidden_size": 32,
+        "projection_size": 24,
+        "num_blocks": 8,
+        "num_layers": 2,
+        "activation_class": torch.nn.SiLU,
+        "device": "cuda",
+    }
+    reference = DreamerV3BlockGRU(**kwargs)
+    triton_module = DreamerV3BlockGRU(**kwargs, recurrent_backend="triton")
+    triton_module.load_state_dict(reference.state_dict())
+    value_source = torch.randn(2, 3, 12, device="cuda")
+    hidden_source = torch.randn(2, 32, device="cuda")
+    is_init = torch.zeros(2, 3, dtype=torch.bool, device="cuda")
+    is_init[0, 1] = True
+    tolerance = {"atol": 3e-4, "rtol": 3e-4}
+
+    def run(module, inputs_require_grad):
+        module.zero_grad(set_to_none=True)
+        value = value_source.detach().clone().requires_grad_(inputs_require_grad)
+        hidden = hidden_source.detach().clone().requires_grad_(inputs_require_grad)
+        output, final_hidden = module(value, hidden, is_init)
+        (output.square().mean() + final_hidden.square().mean()).backward()
+        return value.grad, hidden.grad
+
+    # Frozen world-model rollout: only the inputs receive gradients.
+    for module in (reference, triton_module):
+        module.requires_grad_(False)
+    expected_value_grad, expected_hidden_grad = run(reference, True)
+    value_grad, hidden_grad = run(triton_module, True)
+    torch.testing.assert_close(value_grad, expected_value_grad, **tolerance)
+    torch.testing.assert_close(hidden_grad, expected_hidden_grad, **tolerance)
+    assert all(param.grad is None for param in triton_module.parameters())
+
+    # Partial freeze: a scattered trainable subset checks that the backward
+    # maps needs_input_grad entries onto the right gradient slots.
+    trained = ("cell.dynamic_norms.1.weight", "cell.gates.bias")
+    for module in (reference, triton_module):
+        for name, parameter in module.named_parameters():
+            parameter.requires_grad_(name in trained)
+    run(reference, False)
+    run(triton_module, False)
+    expected_parameters = dict(reference.named_parameters())
+    for name, parameter in triton_module.named_parameters():
+        if name in trained:
+            torch.testing.assert_close(
+                parameter.grad, expected_parameters[name].grad, **tolerance
+            )
+        else:
+            assert parameter.grad is None
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_dreamer_v3_triton,
+    reason="DreamerV3 Triton backend requires CUDA and Triton 3.3+",
+)
+def test_public_block_gru_triton_compile_recurrent_loss():
+    torch.manual_seed(1)
+    kwargs = {
+        "input_size": 16,
+        "hidden_size": 32,
+        "projection_size": 32,
+        "num_blocks": 8,
+        "num_layers": 2,
+        "device": "cuda",
+    }
+    reference = DreamerV3BlockGRU(**kwargs)
+    module = DreamerV3BlockGRU(**kwargs, recurrent_backend="triton")
+    module.load_state_dict(reference.state_dict())
+    compiled = torch.compile(
+        module, fullgraph=True, dynamic=False, mode="reduce-overhead"
+    )
+    value_source = torch.randn(2, 5, 16, device="cuda", requires_grad=True)
+    hidden_source = torch.randn(2, 32, device="cuda", requires_grad=True)
+    is_init = torch.tensor(
+        [[False, False, True, False, False], [True, False, False, False, True]],
+        device="cuda",
+    )
+
+    def run(candidate, value, hidden):
+        output, final_hidden = candidate(value, hidden, is_init)
+        loss = F.smooth_l1_loss(output[:, :-1, :16], value.detach()[:, 1:])
+        loss = loss + 0.01 * final_hidden.square().mean()
+        loss.backward()
+        return output.detach(), final_hidden.detach()
+
+    expected_value = value_source.detach().clone().requires_grad_()
+    expected_hidden = hidden_source.detach().clone().requires_grad_()
+    expected = run(reference, expected_value, expected_hidden)
+    actual = run(compiled, value_source, hidden_source)
+    torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(
+        value_source.grad, expected_value.grad, atol=3e-4, rtol=3e-4
+    )
+    torch.testing.assert_close(
+        hidden_source.grad, expected_hidden.grad, atol=3e-4, rtol=3e-4
+    )
+    for parameter, expected_parameter in zip(
+        module.parameters(), reference.parameters()
+    ):
+        torch.testing.assert_close(
+            parameter.grad, expected_parameter.grad, atol=3e-4, rtol=3e-4
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _has_dreamer_v3_triton,
+    reason="DreamerV3 Triton backend requires CUDA and Triton 3.3+",
+)
+def test_public_block_gru_triton_mixed_dtype_promotes():
+    torch.manual_seed(2)
+    kwargs = {
+        "input_size": 8,
+        "hidden_size": 16,
+        "projection_size": 12,
+        "num_blocks": 2,
+        "device": "cuda",
+    }
+    reference = DreamerV3BlockGRU(**kwargs)
+    triton_module = DreamerV3BlockGRU(**kwargs, recurrent_backend="triton")
+    triton_module.load_state_dict(reference.state_dict())
+    value = torch.randn(2, 3, 8, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(2, 16, device="cuda")
+    is_init = torch.zeros(2, 3, dtype=torch.bool, device="cuda")
+    expected_output, expected_hidden = reference(value, hidden, is_init)
+    output, final_hidden = triton_module(value, hidden, is_init)
+    assert output.dtype == expected_output.dtype
+    assert final_hidden.dtype == expected_hidden.dtype
+    torch.testing.assert_close(output, expected_output, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(final_hidden, expected_hidden, atol=3e-4, rtol=3e-4)
 
 
 if __name__ == "__main__":

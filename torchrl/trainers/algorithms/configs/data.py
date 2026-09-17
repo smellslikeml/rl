@@ -9,14 +9,18 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING
 
 from omegaconf import MISSING
+
+from torchrl.data.replay_buffers import WriterEnsemble
 from torchrl.trainers.algorithms.configs.common import ConfigBase
 
 if TYPE_CHECKING:
     _ReplayServiceBackend = Literal["direct", "ray"]
+    _ReplayTransport = Literal["auto", "direct", "ray", "distributed"]
 else:
-    # OmegaConf structured configs resolve this alias at runtime and do not
+    # OmegaConf structured configs resolve these aliases at runtime and do not
     # support Literal on all TorchRL-supported versions.
     _ReplayServiceBackend = str
+    _ReplayTransport = str
 
 
 @dataclass
@@ -75,11 +79,17 @@ class ConsumingSamplerConfig(SamplerConfig):
     max_sample_count: int = 1
 
 
+def _make_writer_ensemble(writers: list[Any], p: Any = None) -> WriterEnsemble:
+    """Build a writer ensemble from Hydra's keyword-based representation."""
+    del p  # Kept for compatibility with the historical Config schema.
+    return WriterEnsemble(*writers)
+
+
 @dataclass
 class WriterEnsembleConfig(WriterConfig):
     """Configuration for ensemble writer that combines multiple writers."""
 
-    _target_: str = "torchrl.data.replay_buffers.WriterEnsemble"
+    _target_: str = "torchrl.trainers.algorithms.configs.data._make_writer_ensemble"
     writers: list[Any] = field(default_factory=list)
     p: Any = None
 
@@ -131,6 +141,7 @@ class PrioritizedSliceSamplerConfig(SamplerConfig):
     trajectories: Any = None
     cache_values: bool = False
     truncated_key: Any = ("next", "truncated")
+    init_key: Any = "is_init"
     strict_length: bool = True
     compile: Any = False
     span: Any = False
@@ -157,6 +168,7 @@ class SliceSamplerWithoutReplacementConfig(SamplerConfig):
     trajectories: Any = None
     cache_values: bool = False
     truncated_key: Any = ("next", "truncated")
+    init_key: Any = "is_init"
     strict_length: bool = True
     compile: Any = False
     span: Any = False
@@ -173,11 +185,33 @@ class SliceSamplerConfig(SamplerConfig):
     end_key: Any = None
     end_keys: Any = None
     traj_key: Any = None
+    step_key: Any = "step_count"
+    fragmented: bool = False
     ends: Any = None
     trajectories: Any = None
     cache_values: bool = False
     truncated_key: Any = ("next", "truncated")
+    init_key: Any = "is_init"
     strict_length: bool = True
+    compile: Any = False
+    span: Any = False
+    use_gpu: Any = False
+
+
+@dataclass
+class StreamingSliceSamplerConfig(SamplerConfig):
+    """Hydra configuration for :class:`~torchrl.data.StreamingSliceSampler`."""
+
+    _target_: str = "torchrl.data.replay_buffers.StreamingSliceSampler"
+    slice_len: int = MISSING
+    end_key: Any = None
+    end_keys: Any = None
+    traj_key: Any = None
+    cache_values: bool = False
+    truncated_key: Any = ("next", "truncated")
+    init_key: Any = "is_init"
+    strict_length: bool = True
+    pad_output: bool = False
     compile: Any = False
     span: Any = False
     use_gpu: Any = False
@@ -287,11 +321,21 @@ class ListStorageConfig(StorageConfig):
 
 @dataclass
 class StorageEnsembleWriterConfig(StorageConfig):
-    """Configuration for storage ensemble writer."""
+    """Hydra configuration for :class:`~torchrl.data.replay_buffers.WriterEnsemble`.
 
-    _target_: str = "torchrl.data.replay_buffers.StorageEnsembleWriter"
-    writers: list[Any] = MISSING
-    transforms: list[Any] = MISSING
+    This name is a historical typo for
+    :class:`~torchrl.trainers.algorithms.configs.data.WriterEnsembleConfig`.
+    The Config is kept so existing Hydra group references do not vanish
+    without a deprecation cycle.
+
+    Fields match :class:`~torchrl.trainers.algorithms.configs.data.WriterEnsembleConfig`
+    (``writers``, ``p``). ``WriterEnsemble.__init__`` only accepts ``*writers``;
+    ``p`` is stored for Config parity and is not a constructor argument.
+    """
+
+    _target_: str = "torchrl.trainers.algorithms.configs.data._make_writer_ensemble"
+    writers: list[Any] = field(default_factory=list)
+    p: Any = None
 
 
 @dataclass
@@ -420,3 +464,5 @@ class ReplayBufferConfig(ReplayBufferBaseConfig):
     delayed_init: bool | None = None
     service_backend: _ReplayServiceBackend = "direct"
     service_backend_options: dict[str, Any] = field(default_factory=dict)
+    transport: _ReplayTransport = "auto"
+    transport_options: dict[str, Any] | None = None

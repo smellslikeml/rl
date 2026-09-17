@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from torchrl.envs.transforms import ExpandAs, RewardSum
+from torchrl.envs.transforms import DoneTransform, ExpandAs, LastAction, RewardSum
 
 from torchrl.trainers.algorithms.configs.common import (
     _normalize_hydra_key,
@@ -610,6 +610,23 @@ class InitTrackerConfig(TransformConfig):
 
 
 @dataclass
+class LastActionConfig(TransformConfig):
+    """Hydra configuration for :class:`~torchrl.envs.transforms.LastAction`."""
+
+    in_keys: list[Any] | None = None
+    out_keys: list[Any] | None = None
+    default: Any = "zeros"
+    reset_key: Any | None = None
+    _target_: str = (
+        "torchrl.trainers.algorithms.configs.transforms._make_last_action_transform"
+    )
+
+    def __post_init__(self) -> None:
+        """Post-initialization hook for LastAction configuration."""
+        super().__post_init__()
+
+
+@dataclass
 class RenameTransformConfig(TransformConfig):
     """Configuration for RenameTransform."""
 
@@ -787,11 +804,26 @@ class ConditionalPolicySwitchConfig(TransformConfig):
 
 @dataclass
 class KLRewardTransformConfig(TransformConfig):
-    """Configuration for KLRewardTransform."""
+    """Hydra configuration for :class:`~torchrl.envs.llm.transforms.kl.KLRewardTransform`.
 
+    Every kwarg accepted by ``KLRewardTransform.__init__`` is exposed as a field
+    here. Instantiating without ``ref_model`` or ``ref_model_factory`` still
+    fails at runtime because the class requires one of them.
+    """
+
+    ref_model: Any = None
+    ref_model_factory: Any = None
+    coef: Any = 1.0
     in_keys: list[str] | None = None
     out_keys: list[str] | None = None
-    _target_: str = "torchrl.envs.transforms.llm.KLRewardTransform"
+    log_prob_key: Any = ("log_probs", "full")
+    device: Any = None
+    add_to_reward: bool = True
+    tokenizer: Any = None
+    assistant_only: bool = True
+    padding_side: str = "left"
+    use_ray_service: bool = False
+    _target_: str = "torchrl.envs.llm.transforms.kl.KLRewardTransform"
 
     def __post_init__(self) -> None:
         """Post-initialization hook for KLRewardTransform configuration."""
@@ -988,6 +1020,34 @@ class ExpandAsConfig(TransformConfig):
         super().__post_init__()
 
 
+def _make_last_action_transform(*args, **kwargs) -> LastAction:
+    in_keys = _normalize_hydra_keys(kwargs.pop("in_keys", None))
+    out_keys = _normalize_hydra_keys(kwargs.pop("out_keys", None))
+    reset_key = _normalize_hydra_key(kwargs.pop("reset_key", None))
+    return LastAction(
+        in_keys=in_keys,
+        out_keys=out_keys,
+        reset_key=reset_key,
+        **kwargs,
+    )
+
+
+@dataclass
+class DoneTransformConfig(TransformConfig):
+    """Hydra configuration for :class:`~torchrl.envs.transforms.DoneTransform`."""
+
+    in_keys: list[str] | None = None
+    out_keys: list[str] | None = None
+    reward_key: Any = None
+    done_keys: list[str] | None = None
+    _target_: str = (
+        "torchrl.trainers.algorithms.configs.transforms._make_done_transform"
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+
 def _make_reward_sum_transform(*args, **kwargs) -> RewardSum:
     in_keys = _normalize_hydra_keys(kwargs.pop("in_keys", None))
     out_keys = _normalize_hydra_keys(kwargs.pop("out_keys", None))
@@ -1000,3 +1060,18 @@ def _make_expand_as_transform(*args, **kwargs) -> ExpandAs:
     in_key = _normalize_hydra_key(kwargs.pop("in_key", None))
     out_key = _normalize_hydra_key(kwargs.pop("out_key", None))
     return ExpandAs(ref_key=ref_key, in_key=in_key, out_key=out_key)
+
+
+def _make_done_transform(*args, **kwargs) -> DoneTransform:
+    in_keys = _normalize_hydra_keys(kwargs.pop("in_keys", None))
+    out_keys = _normalize_hydra_keys(kwargs.pop("out_keys", None))
+    done_keys = _normalize_hydra_keys(kwargs.pop("done_keys", None))
+    reward_key = kwargs.pop("reward_key", None)
+    if reward_key is not None:
+        reward_key = _normalize_hydra_key(reward_key)
+    return DoneTransform(
+        in_keys=in_keys,
+        out_keys=out_keys,
+        reward_key=reward_key,
+        done_keys=done_keys,
+    )

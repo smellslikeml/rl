@@ -14,6 +14,7 @@ from ._primitive import (
 from .gym_transforms import EndOfLifeTransform
 from .mean_action_selector import MeanActionSelector
 from .module import ModuleTransform
+from .policy_version import PolicyVersion
 from .r3m import R3MTransform
 from .ray_service import RayTransform
 from .rb_transforms import MultiStepTransform, NextStateReconstructor, PolicyAgeFilter
@@ -40,6 +41,7 @@ from .transforms import (
     DecodeVideoTransform,
     DeviceCastTransform,
     DiscreteActionProjection,
+    DoneTransform,
     DoubleToFloat,
     DTypeCastTransform,
     ExcludeTransform,
@@ -52,6 +54,7 @@ from .transforms import (
     gSDENoise,
     Hash,
     InitTracker,
+    LastAction,
     LineariseRewards,
     MultiAction,
     NextObservationDelta,
@@ -152,6 +155,7 @@ __all__ = [
     "DecodeVideoTransform",
     "DeviceCastTransform",
     "DiscreteActionProjection",
+    "DoneTransform",
     "DoubleToFloat",
     "EndOfLifeTransform",
     "ExcludeTransform",
@@ -164,6 +168,7 @@ __all__ = [
     "Hash",
     "HumanoidMacroAction",
     "InitTracker",
+    "LastAction",
     "LineariseRewards",
     "MacroAction",
     "MacroPrimitive",
@@ -180,6 +185,7 @@ __all__ = [
     "NextObservationDelta",
     "NextStateReconstructor",
     "PolicyAgeFilter",
+    "PolicyVersion",
     "NoopResetEnv",
     "ObservationNorm",
     "ObservationTransform",

@@ -28,6 +28,7 @@ from torchrl.envs import (
     BurnInTransform,
     Compose,
     DMControlEnv,
+    DoneTransform,
     EndOfLifeTransform,
     EnvBase,
     EnvCreator,
@@ -42,6 +43,7 @@ from torchrl.envs import (
     StepCounter,
     TargetReturn,
     TerminateTransform,
+    TicTacToeEnv,
     TrajCounter,
     TransformedEnv,
 )
@@ -500,6 +502,89 @@ class TestStepCounter(TransformBase):
         ].any(), "Root done should be False before max_steps"
 
 
+class _AgentNestedCountingEnv(EnvBase):
+    """Counting env whose done keys live under the ``agent`` nest."""
+
+    def __init__(self, max_steps: int = 100, **kwargs):
+        super().__init__(**kwargs)
+        self.max_steps = max_steps
+        self.observation_spec = Composite(
+            observation=Unbounded(
+                (*self.batch_size, 1),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            shape=self.batch_size,
+            device=self.device,
+        )
+        self.reward_spec = Unbounded((*self.batch_size, 1), device=self.device)
+        self.action_spec = Categorical(
+            2, shape=(*self.batch_size, 1), device=self.device
+        )
+        self.done_spec = Composite(
+            {
+                "agent": Composite(
+                    {
+                        "done": Categorical(
+                            2,
+                            dtype=torch.bool,
+                            shape=(*self.batch_size, 1),
+                            device=self.device,
+                        ),
+                        "terminated": Categorical(
+                            2,
+                            dtype=torch.bool,
+                            shape=(*self.batch_size, 1),
+                            device=self.device,
+                        ),
+                    },
+                    shape=self.batch_size,
+                    device=self.device,
+                )
+            },
+            shape=self.batch_size,
+            device=self.device,
+        )
+        self.register_buffer(
+            "count",
+            torch.zeros((*self.batch_size, 1), device=self.device, dtype=torch.int),
+        )
+
+    def _set_seed(self, seed: int | None) -> None:
+        torch.manual_seed(seed)
+
+    def _reset(self, tensordict: TensorDictBase, **kwargs) -> TensorDictBase:
+        self.count[:] = 0
+        done = self.count > self.max_steps
+        return TensorDict(
+            {
+                "observation": self.count.clone(),
+                "agent": {
+                    "done": done,
+                    "terminated": done,
+                },
+            },
+            batch_size=self.batch_size,
+            device=self.device,
+        )
+
+    def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        self.count += 1
+        done = self.count > self.max_steps
+        return TensorDict(
+            {
+                "observation": self.count.clone(),
+                "agent": {
+                    "done": done,
+                    "terminated": done,
+                },
+                "reward": torch.zeros_like(self.count, dtype=torch.get_default_dtype()),
+            },
+            batch_size=self.batch_size,
+            device=self.device,
+        )
+
+
 class TestRandomTruncationTransform(TransformBase):
     def _make_transform(self):
         return Compose(
@@ -710,6 +795,89 @@ class TestRandomTruncationTransform(TransformBase):
                 CountingEnv(max_steps=100),
                 RandomTruncationTransform(min_horizon=1, max_horizon=5),
             )
+
+    def test_nested_done_and_step_count(self):
+        """Nested step_count is read and nested truncated/done flip at the horizon."""
+        torch.manual_seed(0)
+        max_horizon = 5
+        env = TransformedEnv(
+            _AgentNestedCountingEnv(max_steps=100),
+            Compose(
+                StepCounter(),
+                RandomTruncationTransform(
+                    prob=1.0, min_horizon=1, max_horizon=max_horizon
+                ),
+            ),
+        )
+        check_env_specs(env)
+        assert ("agent", "step_count") in env.observation_spec.keys(True, True)
+        assert "step_count" not in env.observation_spec.keys()
+        rollout = env.rollout(20, break_when_any_done=False)
+        step_count = rollout["next", "agent", "step_count"]
+        truncated = rollout["next", "agent", "truncated"]
+        done = rollout["next", "agent", "done"]
+        assert step_count.max() <= max_horizon
+        assert truncated.any(), "nested truncated should flip True by the horizon"
+        assert done[truncated].all()
+        assert (step_count[truncated] >= 1).all()
+        assert (step_count[truncated] <= max_horizon).all()
+
+    def test_custom_step_count_key(self):
+        """A custom StepCounter step_count_key is honored when passed through."""
+        torch.manual_seed(0)
+        max_horizon = 5
+        env = TransformedEnv(
+            CountingEnv(max_steps=100),
+            Compose(
+                StepCounter(step_count_key="my_steps"),
+                RandomTruncationTransform(
+                    prob=1.0,
+                    min_horizon=1,
+                    max_horizon=max_horizon,
+                    step_count_key="my_steps",
+                ),
+            ),
+        )
+        check_env_specs(env)
+        rollout = env.rollout(20, break_when_any_done=False)
+        assert ("next", "my_steps") in rollout.keys(True, True)
+        assert "step_count" not in rollout.keys(True, True)
+        assert rollout["next", "my_steps"].max() <= max_horizon
+        assert rollout["next", "truncated"].any()
+        assert rollout["next", "done"][rollout["next", "truncated"]].all()
+
+    def test_nested_custom_step_count_key(self):
+        """Last-component matching honors a custom NestedKey on a nested env."""
+        torch.manual_seed(0)
+        max_horizon = 5
+        env = TransformedEnv(
+            _AgentNestedCountingEnv(max_steps=100),
+            Compose(
+                StepCounter(step_count_key="my_steps"),
+                RandomTruncationTransform(
+                    prob=1.0,
+                    min_horizon=1,
+                    max_horizon=max_horizon,
+                    step_count_key="my_steps",
+                ),
+            ),
+        )
+        check_env_specs(env)
+        obs_keys = env.observation_spec.keys(True, True)
+        assert ("agent", "my_steps") in obs_keys
+        assert "my_steps" not in obs_keys
+        assert "step_count" not in obs_keys
+        rollout = env.rollout(20, break_when_any_done=False)
+        assert ("next", "agent", "my_steps") in rollout.keys(True, True)
+        assert "step_count" not in rollout.keys(True, True)
+        step_count = rollout["next", "agent", "my_steps"]
+        truncated = rollout["next", "agent", "truncated"]
+        done = rollout["next", "agent", "done"]
+        assert step_count.max() <= max_horizon
+        assert truncated.any(), "nested truncated should flip True by the horizon"
+        assert done[truncated].all()
+        assert (step_count[truncated] >= 1).all()
+        assert (step_count[truncated] <= max_horizon).all()
 
     def test_validation(self):
         """Invalid parameters raise ValueError."""
@@ -2255,6 +2423,142 @@ class TestExpandAs(TransformBase):
 
     def test_transform_inverse(self):
         raise pytest.skip("No inverse method for ExpandAs")
+
+
+class TestDoneTransform:
+    def test_rollout_writes_group_done(self):
+        n_agents = 3
+        env = TransformedEnv(
+            NestedCountingEnv(
+                nest_done=False,
+                nest_reward=True,
+                nested_dim=n_agents,
+                max_steps=10,
+            ),
+            DoneTransform(
+                in_keys=["done", "terminated"],
+                reward_key=("data", "reward"),
+            ),
+        )
+        check_env_specs(env)
+        obs_keys = set(env.observation_spec.keys(True, True))
+        assert ("data", "done") in obs_keys
+        assert ("data", "terminated") in obs_keys
+        assert ("data", "done") not in env.done_keys
+        assert ("data", "terminated") not in env.done_keys
+        td = env.rollout(4)
+        reward = td.get(("next", "data", "reward"))
+        done = td.get(("next", "data", "done"))
+        terminated = td.get(("next", "data", "terminated"))
+        assert done.shape == reward.shape
+        assert terminated.shape == reward.shape
+        assert done.dtype == torch.bool
+        assert (done == td.get(("next", "done")).unsqueeze(-1)).all()
+        assert (terminated == td.get(("next", "terminated")).unsqueeze(-1)).all()
+
+    def test_nested_keys(self):
+        t = DoneTransform(
+            in_keys=[("root", "done")],
+            out_keys=[("agents", "done")],
+            reward_key=("agents", "reward"),
+        )
+        td = TensorDict(
+            {
+                "root": {"done": torch.tensor([[True], [False]])},
+                "agents": {"reward": torch.zeros(2, 4, 1)},
+            },
+            [2],
+        )
+        td = t(td)
+        assert td["agents", "done"].shape == torch.Size([2, 4, 1])
+        assert bool(td["agents", "done"][0].all())
+        assert bool((~td["agents", "done"][1]).all())
+
+    def test_forward_expands_under_next(self):
+        t = DoneTransform(
+            in_keys=["done", "terminated"],
+            reward_key=("agents", "reward"),
+        )
+        td = TensorDict(
+            {
+                "next": {
+                    "done": torch.tensor([[False], [True]]),
+                    "terminated": torch.tensor([[False], [True]]),
+                    "agents": {"reward": torch.zeros(2, 3, 1)},
+                }
+            },
+            [2],
+        )
+        td = t(td)
+        assert td["next", "agents", "done"].shape == torch.Size([2, 3, 1])
+        assert td["next", "agents", "terminated"].shape == torch.Size([2, 3, 1])
+        assert (td["next", "agents", "done"] == td["next", "done"].unsqueeze(-1)).all()
+
+    def test_done_keys_alias(self):
+        t = DoneTransform(
+            reward_key=("agents", "reward"),
+            done_keys=["done"],
+        )
+        td = TensorDict(
+            {
+                "next": {
+                    "done": torch.tensor([[True], [False]]),
+                    "agents": {"reward": torch.ones(2, 5, 1)},
+                }
+            },
+            [2],
+        )
+        td = t(td)
+        assert t.out_keys == [("agents", "done")]
+        assert td["next", "agents", "done"].shape == torch.Size([2, 5, 1])
+
+    def test_in_keys_and_done_keys_raise(self):
+        with pytest.raises(TypeError, match="in_keys or done_keys"):
+            DoneTransform(
+                in_keys=["done"],
+                done_keys=["terminated"],
+                reward_key="reward",
+            )
+
+    def test_gae_reads_expanded_done(self):
+        n_agents = 3
+        env = TransformedEnv(
+            NestedCountingEnv(
+                nest_done=False,
+                nest_reward=True,
+                nested_dim=n_agents,
+                max_steps=10,
+            ),
+            DoneTransform(
+                in_keys=["done", "terminated"],
+                reward_key=("data", "reward"),
+            ),
+        )
+        td = env.rollout(4)
+        value_shape = td.get(("next", "data", "reward")).shape
+        td.set(("data", "state_value"), torch.zeros(value_shape))
+        td.set(("next", "data", "state_value"), torch.zeros(value_shape))
+        gae = GAE(gamma=0.99, lmbda=0.95, value_network=None, differentiable=False)
+        gae.set_keys(
+            reward=("data", "reward"),
+            done=("data", "done"),
+            terminated=("data", "terminated"),
+            value=("data", "state_value"),
+        )
+        gae(td)
+        assert "advantage" in td.keys()
+        assert td["advantage"].shape == value_shape
+
+    def test_unlocked_batched_reset_expands_group_done(self):
+        env = TransformedEnv(
+            TicTacToeEnv(),
+            DoneTransform(reward_key=("player0", "reward")),
+        )
+        td = env.reset(TensorDict(batch_size=[2]))
+        assert td["player0", "done"].shape == torch.Size([2, 1])
+        assert td["player0", "terminated"].shape == torch.Size([2, 1])
+        assert (td["player0", "done"] == td["done"]).all()
+        assert (td["player0", "terminated"] == td["terminated"]).all()
 
 
 class TestTerminateTransform:

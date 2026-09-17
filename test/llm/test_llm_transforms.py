@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 
 import json
 
 import pytest
+import torch
 from tensordict import set_list_to_stack, TensorDict
+from torch import nn
 
 from torchrl.data.llm import History
 from torchrl.envs.llm import ChatEnv
@@ -18,12 +21,20 @@ from torchrl.envs.llm.transforms import (
     ExecuteToolsInOrder,
     IncrementalTokenizer,
     JSONCallParser,
+    KLRewardTransform,
     PolicyVersion,
+    RetrieveLogProb,
+    Tokenizer,
     ToolCall,
     ToolRegistry,
     XMLBlockParser,
 )
-from torchrl.envs.transforms import TransformedEnv
+from torchrl.envs.transforms import (
+    PolicyVersion as EnvPolicyVersion,
+    Tokenizer as EnvTokenizer,
+    TransformedEnv,
+)
+from torchrl.testing.mocking_classes import CountingEnv
 
 _has_transformers = importlib.util.find_spec("transformers") is not None
 
@@ -462,6 +473,9 @@ class TestToolCall:
 class TestIncrementalTokenizer:
     """Tests for the IncrementalTokenizer transform."""
 
+    class DummyTokenizer:
+        vocab_size = 32
+
     def test_reset_tokenizes_history(self, tokenizer):
         """Test that reset produces correct tokens from history."""
         system_prompt = "You are a helpful assistant."
@@ -720,8 +734,94 @@ class TestIncrementalTokenizer:
         tokens = result.get(("tokens", "prompt"), as_list=True)
         assert tokens[0].numel() > 0
 
+    @pytest.mark.parametrize(
+        "tokens_key, expected_full_key, decoy_key",
+        [
+            pytest.param(
+                ("obs", "tok", "prompt"),
+                ("obs", "tok", "full"),
+                ("obs", "full"),
+                id="nested",
+            ),
+            pytest.param(
+                "tokens",
+                ("tokens", "full"),
+                "tokens_full",
+                id="string",
+            ),
+            pytest.param(
+                ("tokens",),
+                ("tokens", "full"),
+                "full",
+                id="one_tuple",
+            ),
+        ],
+    )
+    def test_step_tokens_full_key(self, tokens_key, expected_full_key, decoy_key):
+        """Reuse tokens.full under the last NestedKey component; decoys fail the old lookups."""
+        tokens_full = torch.tensor([1, 2, 3])
+        decoy = torch.tensor([9, 9, 9])
+        transform = IncrementalTokenizer(
+            self.DummyTokenizer(),
+            tokens_key=tokens_key,
+        )
+        td = TensorDict(
+            {
+                expected_full_key: tokens_full,
+                decoy_key: decoy,
+            },
+            batch_size=(),
+        )
+        next_td = TensorDict(batch_size=())
+        out = transform._step(td, next_td)
+        assert torch.equal(out[tokens_key], tokens_full)
+
+
+class TestTokenizer:
+    @pytest.mark.parametrize("tokenizer_cls", [Tokenizer, EnvTokenizer])
+    @pytest.mark.filterwarnings("error::DeprecationWarning")
+    def test_device_follows_env_to(self, tokenizer_cls):
+        # Cached parent.device goes stale after env.to (issue #4345).
+        class DummyTokenizer:
+            def __call__(self, value, return_tensors="pt", **kwargs):
+                batch = 1 if isinstance(value, str) else len(value)
+                return {
+                    "input_ids": torch.ones(batch, 2, dtype=torch.long),
+                    "attention_mask": torch.ones(batch, 2, dtype=torch.long),
+                }
+
+        t = tokenizer_cls(
+            in_keys=[("text", "prompt")],
+            out_keys=[("tokens", "prompt")],
+            tokenizer=DummyTokenizer(),
+        )
+        td = TensorDict({("text", "prompt"): "hello"})
+        assert t.out_device is None
+        out = t(td.clone())
+        assert out["tokens", "prompt"].device == torch.device("cpu")
+        with pytest.warns(DeprecationWarning, match=r"v0\.17.*out_device"):
+            assert t.device is None
+
+        env = TransformedEnv(CountingEnv(), t)
+        try:
+            for device in (None, "cpu", "meta"):
+                if device is not None:
+                    env.to(device)
+                expected = torch.device(device) if device is not None else None
+                assert t.out_device == expected
+                out = t(td.clone())
+                for key in ("prompt", "attention_mask"):
+                    assert out["tokens", key].device == torch.device(device or "cpu")
+                with pytest.warns(DeprecationWarning, match=r"v0\.17.*out_device"):
+                    assert t.device == t.out_device
+        finally:
+            env.close()
+
 
 class TestPolicyVersion:
+    def test_compatibility_alias(self):
+        assert PolicyVersion is EnvPolicyVersion
+
     def test_int_version_dtype_and_device(self):
         """Integer policy version must stay int64 and follow the tensordict device.
 
@@ -747,3 +847,184 @@ class TestPolicyVersion:
             version_cuda = out_cuda.get("policy_version")
             assert version_cuda.dtype == torch.int64
             assert version_cuda.device.type == "cuda"
+
+
+_CROSS_DEVICE_PARAMS = [
+    pytest.param(
+        "cuda",
+        marks=[
+            pytest.mark.gpu,
+            pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+        ],
+    ),
+    pytest.param(
+        "mps",
+        marks=pytest.mark.skipif(
+            not torch.backends.mps.is_available(), reason="needs MPS"
+        ),
+    ),
+]
+
+
+class _MockLLMModule(nn.Module):
+    """Minimal stand-in for an LLM wrapper used by KL / log-prob transforms."""
+
+    def __init__(self, input_mode: str = "tokens", *, device=None):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1, device=device))
+        self.generate = False
+        self.return_log_probs = True
+        self.input_mode = input_mode
+        self.in_keys = [("tokens", "full")]
+        self.log_probs_key = "log_probs"
+        self.pad_output = True
+
+    def forward(self, tensordict: TensorDict) -> TensorDict:
+        tokens = tensordict.get(("tokens", "full"))
+        tensordict[("log_probs", "full")] = (
+            tokens.to(dtype=self.weight.dtype) * self.weight
+        )
+        return tensordict
+
+
+class _DummyTokensParent:
+    class base_env:
+        input_mode = "tokens"
+
+
+class TestKLModuleDevice:
+    @pytest.mark.parametrize("accelerator", _CROSS_DEVICE_PARAMS)
+    def test_retrieve_log_prob_constructor_device_moves_cpu_input(self, accelerator):
+        model = _MockLLMModule(device=accelerator)
+        transform = RetrieveLogProb(model, assistant_only=False, device=accelerator)
+        with pytest.warns(DeprecationWarning, match="removed in v0.17") as rec:
+            assert transform.device == torch.device(accelerator)
+        assert rec.list[0].filename == __file__
+        td = TensorDict(
+            {("tokens", "full"): torch.ones(2, 4, dtype=torch.long)},
+            batch_size=[2],
+            device="cpu",
+        )
+        out = transform(td)
+        log_probs = out.get(("log_probs", "full"))
+        assert torch.isfinite(log_probs).all()
+        assert log_probs.shape == (2, 4)
+
+    @pytest.mark.parametrize("accelerator", _CROSS_DEVICE_PARAMS)
+    def test_retrieve_log_prob_to_accelerator_does_not_recast_input(self, accelerator):
+        transform = RetrieveLogProb(
+            _MockLLMModule(), assistant_only=False, device="cpu"
+        ).to(accelerator)
+        td = TensorDict(
+            {
+                ("tokens", "full"): torch.ones(
+                    2, 4, dtype=torch.long, device=accelerator
+                )
+            },
+            batch_size=[2],
+            device=accelerator,
+        )
+        out = transform(td)
+        log_probs = out.get(("log_probs", "full"))
+        assert torch.isfinite(log_probs).all()
+        assert log_probs.device.type == torch.device(accelerator).type
+
+    def test_retrieve_log_prob_to_meta_does_not_recast_input(self):
+        transform = RetrieveLogProb(
+            _MockLLMModule(), assistant_only=False, device="cpu"
+        ).to("meta")
+        td = TensorDict(
+            {("tokens", "full"): torch.ones(2, 4, dtype=torch.long, device="meta")},
+            batch_size=[2],
+            device="meta",
+        )
+        out = transform(td)
+        assert out.get(("log_probs", "full")).device.type == "meta"
+
+    @pytest.mark.parametrize("accelerator", _CROSS_DEVICE_PARAMS)
+    def test_kl_reward_transform_constructor_device_moves_cpu_input(self, accelerator):
+        model = _MockLLMModule(device=accelerator)
+        transform = KLRewardTransform(model, device=accelerator)
+        transform.__dict__["_parent"] = _DummyTokensParent()
+        with pytest.warns(DeprecationWarning, match="removed in v0.17") as rec:
+            assert transform.device == torch.device(accelerator)
+        assert rec.list[0].filename == __file__
+        td = TensorDict(
+            {
+                ("tokens", "full"): torch.ones(2, 4, dtype=torch.long),
+                ("log_probs", "full"): torch.zeros(2, 4),
+                ("masks", "all_assistant_mask"): torch.ones(2, 4, dtype=torch.bool),
+            },
+            batch_size=[2],
+            device="cpu",
+        )
+        next_td = TensorDict(
+            {"reward": torch.zeros(2, 4, 1)},
+            batch_size=[2],
+            device="cpu",
+        )
+        out = transform._step(td, next_td)
+        assert out.device.type == "cpu"
+        assert torch.isfinite(out["kl_penalty"]).all()
+        assert out["kl_penalty"].device.type == "cpu"
+        assert out["ref_log_probs"].device.type == "cpu"
+
+    @pytest.mark.parametrize("accelerator", _CROSS_DEVICE_PARAMS)
+    def test_kl_reward_transform_to_accelerator_does_not_recast_input(
+        self, accelerator
+    ):
+        transform = KLRewardTransform(_MockLLMModule(), device="cpu").to(accelerator)
+        # Transform.to() clears the parent cache; attach after the device move.
+        transform.__dict__["_parent"] = _DummyTokensParent()
+        td = TensorDict(
+            {
+                ("tokens", "full"): torch.ones(
+                    2, 4, dtype=torch.long, device=accelerator
+                ),
+                ("log_probs", "full"): torch.zeros(2, 4, device=accelerator),
+                ("masks", "all_assistant_mask"): torch.ones(
+                    2, 4, dtype=torch.bool, device=accelerator
+                ),
+                "next": TensorDict(
+                    {"reward": torch.zeros(2, 4, 1, device=accelerator)},
+                    batch_size=[2],
+                    device=accelerator,
+                ),
+            },
+            batch_size=[2],
+            device=accelerator,
+        )
+        out = transform(td)["next"]
+        assert out.device.type == torch.device(accelerator).type
+        assert torch.isfinite(out["kl_penalty"]).all()
+        assert out["kl_penalty"].device.type == torch.device(accelerator).type
+        assert out["ref_log_probs"].device.type == torch.device(accelerator).type
+
+    def test_kl_reward_transform_to_meta_does_not_recast_input(self):
+        transform = KLRewardTransform(_MockLLMModule(), device="cpu").to("meta")
+        # Transform.to() clears the parent cache; attach after the device move.
+        transform.__dict__["_parent"] = _DummyTokensParent()
+        td = TensorDict(
+            {
+                ("tokens", "full"): torch.ones(2, 4, dtype=torch.long, device="meta"),
+                ("log_probs", "full"): torch.zeros(2, 4, device="meta"),
+                ("masks", "all_assistant_mask"): torch.ones(
+                    2, 4, dtype=torch.bool, device="meta"
+                ),
+                "next": TensorDict(
+                    {"reward": torch.zeros(2, 4, 1, device="meta")},
+                    batch_size=[2],
+                    device="meta",
+                ),
+            },
+            batch_size=[2],
+            device="meta",
+        )
+        out = transform(td)["next"]
+        assert out["kl_penalty"].device.type == "meta"
+        assert out["ref_log_probs"].device.type == "meta"
+
+
+if __name__ == "__main__":
+    args, unknown = argparse.ArgumentParser().parse_known_args()
+    pytest.main([__file__, "--capture", "no", "--exitfirst"] + unknown)

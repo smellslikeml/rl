@@ -25,6 +25,10 @@ from .gp import GPWorldModel
 from .llm import GPT2RewardModel
 from .model_based import (
     DreamerActor,
+    DreamerV3BlockGRU,
+    DreamerV3BlockGRUCell,
+    DreamerV3ImageDecoder,
+    DreamerV3ImageEncoder,
     DreamerV3MLP,
     ObsDecoder,
     ObsEncoder,
@@ -34,6 +38,7 @@ from .model_based import (
     RSSMPriorV3,
     RSSMRollout,
     RSSMRolloutV3,
+    RSSMStateEstimatorV3,
     SymExpTwoHot,
 )
 from .models import (
@@ -83,6 +88,10 @@ __all__ = [
     "DecisionTransformer",
     "DistributionalDQNnet",
     "DreamerActor",
+    "DreamerV3BlockGRU",
+    "DreamerV3BlockGRUCell",
+    "DreamerV3ImageDecoder",
+    "DreamerV3ImageEncoder",
     "DreamerV3MLP",
     "DTActor",
     "DuelingCnnDQNet",
@@ -106,6 +115,7 @@ __all__ = [
     "RSSMPriorV3",
     "RSSMRollout",
     "RSSMRolloutV3",
+    "RSSMStateEstimatorV3",
     "Squeeze2dLayer",
     "SqueezeLayer",
     "SymExpTwoHot",

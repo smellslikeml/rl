@@ -17,7 +17,7 @@ from torchrl.collectors.llm import LLMCollector
 from torchrl.collectors.weight_update import WeightUpdaterBase
 from torchrl.data.replay_buffers.replay_buffers import ReplayBuffer
 from torchrl.envs import EnvBase
-from torchrl.envs.llm.transforms.policy_version import PolicyVersion
+from torchrl.envs.transforms import PolicyVersion
 
 RAY_ERR = None
 try:
@@ -42,7 +42,9 @@ class RayLLMCollector(LLMCollector):
         dialog_turns_per_batch (int): A keyword-only argument representing the total
             number of elements in a batch.
         total_dialog_turns (int): A keyword-only argument representing the total
-            number of dialog turns returned by the collector during its lifespan.
+            number of environment dialog turns (steps that actually ran) during
+            the collector's lifespan. When ``yield_only_last_steps=True``,
+            dropped intermediate turns still count.
         yield_only_last_steps (bool, optional): whether to yield every step of a trajectory, or only the
             last (done) steps.
         yield_completed_trajectories (bool, optional): whether to yield batches of rollouts with a given number of steps
@@ -125,6 +127,10 @@ class RayLLMCollector(LLMCollector):
             remote_config.setdefault("num_gpus", num_gpus)
         remote_cls = LLMCollector.as_remote(remote_config).remote
         self.sync_iter = sync_iter
+        # Keep a local handle on the replay buffer so that buffer-facing
+        # helpers inherited from Collector (e.g. ``getattr_rb``) work on this
+        # wrapper: the remote collector holds its own reference.
+        self.replay_buffer = replay_buffer
         self._collector = remote_cls(
             env=env,
             policy=policy,
@@ -173,6 +179,16 @@ class RayLLMCollector(LLMCollector):
                     yield result
             except StopIteration:
                 break
+
+    @property
+    def init_random_frames(self) -> int:
+        """Number of random warmup frames (always 0 for LLM collectors).
+
+        The remote :class:`~torchrl.collectors.llm.LLMCollector` is created
+        without ``init_random_frames``, so the local wrapper reports 0. This
+        attribute is read by :class:`~torchrl.trainers.Trainer`.
+        """
+        return 0
 
     def start(self):
         """Starts the collector in a background thread."""

@@ -28,6 +28,7 @@ from torchrl._utils import (
     _maybe_record_function_decorator,
     _replace_last,
     accept_remote_rref_udf_invocation,
+    mark_weight_update,
     prod,
     RL_WARNINGS,
 )
@@ -48,7 +49,7 @@ from torchrl.data import ReplayBuffer
 from torchrl.data.utils import DEVICE_TYPING
 from torchrl.envs import EnvBase, EnvCreator, StepCounter, TransformedEnv
 from torchrl.envs.common import _do_nothing
-from torchrl.envs.llm.transforms import PolicyVersion
+from torchrl.envs.transforms import PolicyVersion
 from torchrl.envs.utils import (
     _aggregate_end_of_traj,
     _make_compatible_policy,
@@ -564,7 +565,7 @@ class Collector(BaseCollector, metaclass=_CollectorMeta):
             RPCCollector -> MultiSyncCollector -> Collector.
             Defaults to ``None``.
         track_policy_version (bool or PolicyVersion, optional): if ``True``, the collector will track the version of the policy.
-            A :class:`~torchrl.envs.llm.transforms.policy_version.PolicyVersion` transform is
+            A :class:`~torchrl.envs.transforms.PolicyVersion` transform is
             installed on the environment, tagging every collected frame with the current version
             under the ``"policy_version"`` key. The transform's version is bumped exactly once
             per :meth:`update_policy_weights_` call — for multi-process collectors this happens
@@ -572,7 +573,7 @@ class Collector(BaseCollector, metaclass=_CollectorMeta):
             tagging tracks real weight updates rather than rollout iterations.
 
             The recommended path is ``track_policy_version=True``: let the collector own the
-            transform. Passing a :class:`~torchrl.envs.llm.transforms.policy_version.PolicyVersion`
+            transform. Passing a :class:`~torchrl.envs.transforms.PolicyVersion`
             instance directly is reserved for advanced use cases that wire up a ``PolicyVersion``
             **without** going through a collector (e.g. a hand-rolled rollout loop). Pre-creating
             a transform and passing it to a collector is supported but discouraged because it
@@ -1490,6 +1491,11 @@ class Collector(BaseCollector, metaclass=_CollectorMeta):
                         policy_input = policy_input.to(self.policy_device)
                     if self.compiled_policy:
                         cudagraph_mark_step_begin()
+                    elif self.cudagraphed_policy:
+                        try:
+                            cudagraph_mark_step_begin()
+                        except NotImplementedError:
+                            pass
                     policy_output = self._wrapped_policy(policy_input)
                 policy_output_keys = set(policy_output.keys(True, True))
                 missing_out_keys = [
@@ -1550,6 +1556,11 @@ class Collector(BaseCollector, metaclass=_CollectorMeta):
                 )  # to test if values have changed in-place
                 if self.compiled_policy:
                     cudagraph_mark_step_begin()
+                elif self.cudagraphed_policy:
+                    try:
+                        cudagraph_mark_step_begin()
+                    except NotImplementedError:
+                        pass
                 policy_output = self._wrapped_policy(policy_input)
 
                 # check that we don't have exclusive keys, because they don't appear in keys
@@ -1721,6 +1732,7 @@ class Collector(BaseCollector, metaclass=_CollectorMeta):
             and self._policy_w_state_dict is not None
         ):
             TensorDict.from_module(self._policy_w_state_dict).data.update_(weights.data)
+            mark_weight_update(self._policy_w_state_dict)
             return
         raise RuntimeError("Collector has no mutable local policy weight target.")
 
@@ -1831,6 +1843,8 @@ class Collector(BaseCollector, metaclass=_CollectorMeta):
                         self.post_collect_hook(tensordict_out)
                     yield tensordict_out
                 elif self.replay_buffer is not None and not self._ignore_rb:
+                    if self.post_collect_hook is not None:
+                        self.post_collect_hook(tensordict_out)
                     tensordict_out = _maybe_normalize_replay_buffer_tensordict_device(
                         tensordict_out, self.replay_buffer
                     )
@@ -2100,9 +2114,14 @@ class Collector(BaseCollector, metaclass=_CollectorMeta):
                     # we still do the assignment for security
                     if self.compiled_policy:
                         cudagraph_mark_step_begin()
+                    elif self.cudagraphed_policy:
+                        try:
+                            cudagraph_mark_step_begin()
+                        except NotImplementedError:
+                            pass
                     with _maybe_record_function("Collector.policy"):
                         policy_output = self._wrapped_policy(policy_input)
-                    if self.compiled_policy:
+                    if self.compiled_policy or self.cudagraphed_policy:
                         policy_output = policy_output.select(
                             *self._policy_output_keys, strict=False
                         ).clone()

@@ -7,6 +7,7 @@ from __future__ import annotations
 import collections
 import contextvars
 import functools
+import importlib.metadata
 import inspect
 import logging
 import math
@@ -25,6 +26,7 @@ from typing import Any, cast, TypeVar
 
 import numpy as np
 import torch
+from packaging import version as _packaging_version
 
 from pyvers import implement_for  # noqa: F401
 from tensordict import unravel_key
@@ -121,6 +123,20 @@ def _mp_sharing_strategy_for_spawn() -> str | None:
 @implement_for("torch", "2.8")
 def _mp_sharing_strategy_for_spawn() -> str | None:  # noqa: F811
     return None
+
+
+def _triton_version_at_least(minimum: str) -> bool:
+    """Return whether the installed triton distribution is at least ``minimum``.
+
+    The version is read from package metadata rather than by importing triton:
+    importing triton is expensive and can fail at probe time on older or
+    partial installs, and ``find_spec`` cannot report a version.
+    """
+    try:
+        triton_version = importlib.metadata.version("triton")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return _packaging_version.parse(triton_version) >= _packaging_version.parse(minimum)
 
 
 def strtobool(val: Any) -> bool:
@@ -223,6 +239,10 @@ class timeit:
 
     Args:
         name (str): The name of the timer.
+        sync (bool, optional): If ``True``, synchronize CUDA before taking each
+            start and elapsed timestamp. This measures completed CUDA work rather
+            than asynchronous launch time. This is a no-op when CUDA is unavailable.
+            Defaults to ``False``.
 
     Examples:
         >>> from torchrl import timeit
@@ -253,8 +273,9 @@ class timeit:
     _REG = {}
     _MARKS = {}
 
-    def __init__(self, name):
+    def __init__(self, name: str, *, sync: bool = False):
         self.name = name
+        self._sync = sync
 
     def __call__(self, fn: Callable) -> Callable:
         @wraps(fn)
@@ -266,6 +287,8 @@ class timeit:
         return decorated_fn
 
     def __enter__(self) -> timeit:
+        if self._sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
         self.t0 = time.time()
         return self
 
@@ -285,6 +308,8 @@ class timeit:
             ...     if i % 10 == 0:
             ...         print(f"Elapsed: {timer.elapsed():.3f}s")
         """
+        if self._sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
         self.t0 = time.time()
         return self
 
@@ -302,6 +327,8 @@ class timeit:
             ...     print(f"Elapsed so far: {timer.elapsed():.3f}s")
             ...     # do more work
         """
+        if self._sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
         return time.time() - self.t0
 
     @classmethod
@@ -1282,8 +1309,9 @@ class set_auto_unwrap_transformed_env(_DecoratorContextManager):
             instances. If ``False``, :class:`~torchrl.envs.TransformedEnv` will not unwrap nested instances.
             Defaults to ``True``.
 
-    .. note:: Until v0.9, this will raise a warning if :class:`~torchrl.envs.TransformedEnv` are nested
-        and the value is not set explicitly (`auto_unwrap=True` default behavior).
+    .. note:: If this value is not set explicitly, nesting
+        :class:`~torchrl.envs.TransformedEnv` instances emits an informational
+        warning and uses ``auto_unwrap=True``.
         You can set the value of :func:`~torchrl.envs.auto_unwrap_transformed_env`
         through:
 
@@ -1836,3 +1864,25 @@ def merge_ray_runtime_env(ray_init_config: dict[str, Any]) -> dict[str, Any]:
 def rl_warnings():
     """Checks the status of the RL_WARNINGS env varioble."""
     return RL_WARNINGS
+
+
+def mark_weight_update(module: Any) -> None:
+    """Notify a policy that its weights were just replaced.
+
+    Modules that keep inference-time state derived from their parameters, such
+    as the key/value cache of :class:`~torchrl.modules.TransformerModule`,
+    implement a ``mark_weight_update()`` method that discards that state.
+    TorchRL's weight-synchronization paths call this helper after applying new
+    weights so every such module below ``module`` is notified; user code that
+    updates parameters by other means should call it too.
+
+    Args:
+        module (Any): the policy that received new weights. Objects that are
+            not :class:`torch.nn.Module` instances are ignored.
+    """
+    if not isinstance(module, torch.nn.Module):
+        return
+    for submodule in module.modules():
+        hook = getattr(submodule, "mark_weight_update", None)
+        if callable(hook):
+            hook()

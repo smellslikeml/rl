@@ -34,10 +34,16 @@ from tensordict.nn import (
 )
 from tensordict.utils import expand_as_right
 from torch import distributions as d
-from torchrl._utils import logger as torchrl_logger, VERBOSE
+from torchrl._utils import logger as torchrl_logger
 from torchrl.envs.transforms.ray_service import _maybe_clear_device, _maybe_to_device
 from torchrl.envs.transforms.transforms import Transform
-from torchrl.modules.distributions.utils import composite_entropy, sample_and_log_prob
+from torchrl.modules.distributions.utils import (
+    _warn_mc_entropy,
+    composite_entropy,
+    has_analytic_entropy,
+    is_dynamo_compiling,
+    sample_and_log_prob,
+)
 from torchrl.modules.llm import LLMWrapperBase
 from torchrl.objectives.common import LossModule
 from torchrl.objectives.utils import _sum_td_features, _validate_clip_epsilon
@@ -661,10 +667,9 @@ class GRPOLoss(LossModule):
             raise ValueError(
                 f"Advantage key {self.tensor_keys.advantage} not in tensordict."
             )
-        log_weight, dist, kl_approx = self._log_weight(
+        log_weight, dist, kl_approx, mask = self._log_weight(
             tensordict, adv_shape=advantage.shape[:-1]
         )
-        mask = dist.mask
 
         # Optional per-token trust-region filtering (KL-Mask) vs reference policy
         if self.kl_mask_threshold is not None and self.kl_mask_threshold > 0:
@@ -810,38 +815,49 @@ class GRPOLoss(LossModule):
     def _get_entropy(
         self, dist: d.Distribution, adv_shape: torch.Size
     ) -> torch.Tensor | TensorDict:
-        try:
-            entropy = (
-                composite_entropy(dist, self.samples_mc_entropy)
-                if isinstance(dist, CompositeDistribution)
-                else dist.entropy()
+        is_composite = isinstance(dist, CompositeDistribution)
+        if is_composite:
+            can_compute_component_entropy = all(
+                has_analytic_entropy(component) or component.has_rsample
+                for component in dist.dists.values()
             )
-            if not entropy.isfinite().all():
-                del entropy
-                if VERBOSE:
-                    torchrl_logger.info(
-                        "Entropy is not finite. Using Monte Carlo sampling."
+            if can_compute_component_entropy:
+                entropy = composite_entropy(dist, self.samples_mc_entropy)
+            else:
+                if not is_dynamo_compiling():
+                    _warn_mc_entropy(dist)
+                with set_composite_lp_aggregate(False):
+                    _, log_prob = sample_and_log_prob(
+                        dist,
+                        (self.samples_mc_entropy,),
+                        reparameterize=getattr(dist, "has_rsample", False),
                     )
-                raise NotImplementedError
-        except NotImplementedError:
-            if VERBOSE:
-                torchrl_logger.warning(
-                    f"Entropy not implemented for {type(dist)} or is not finite. Using Monte Carlo sampling."
-                )
-            with set_composite_lp_aggregate(False) if isinstance(
-                dist, CompositeDistribution
-            ) else contextlib.nullcontext():
+                    if isinstance(self.tensor_keys.sample_log_prob, NestedKey):
+                        log_prob = log_prob.get(self.tensor_keys.sample_log_prob)
+                    else:
+                        log_prob = log_prob.select(*self.tensor_keys.sample_log_prob)
+                entropy = -log_prob.mean(0)
+        else:
+            analytic_entropy = has_analytic_entropy(dist)
+            if analytic_entropy:
+                entropy = dist.entropy()
+            compiling = is_dynamo_compiling()
+            needs_mc = not analytic_entropy or compiling
+            if analytic_entropy and not compiling and not entropy.isfinite().all():
+                needs_mc = True
+            if needs_mc:
+                if not compiling:
+                    _warn_mc_entropy(dist)
                 _, log_prob = sample_and_log_prob(
                     dist,
                     (self.samples_mc_entropy,),
                     reparameterize=getattr(dist, "has_rsample", False),
                 )
-                if is_tensor_collection(log_prob):
-                    if isinstance(self.tensor_keys.sample_log_prob, NestedKey):
-                        log_prob = log_prob.get(self.tensor_keys.sample_log_prob)
-                    else:
-                        log_prob = log_prob.select(*self.tensor_keys.sample_log_prob)
-            entropy = -log_prob.mean(0)
+                sampled_entropy = -log_prob.mean(0)
+                if analytic_entropy and compiling:
+                    entropy = torch.where(entropy.isfinite(), entropy, sampled_entropy)
+                else:
+                    entropy = sampled_entropy
         if is_tensor_collection(entropy) and entropy.batch_size != adv_shape:
             entropy.batch_size = adv_shape
         return entropy.unsqueeze(-1)
@@ -889,7 +905,7 @@ class GRPOLoss(LossModule):
 
     def _log_weight(
         self, tensordict: TensorDictBase, adv_shape: torch.Size
-    ) -> tuple[torch.Tensor, d.Distribution, torch.Tensor]:
+    ) -> tuple[torch.Tensor, d.Distribution, torch.Tensor, torch.Tensor]:
 
         cur_log_prob, dist, is_composite = self._get_cur_log_prob(tensordict)
 
@@ -926,7 +942,11 @@ class GRPOLoss(LossModule):
             )
             raise ValueError(error_msg)
 
-        attention_mask = dist.mask
+        # 0.0 is a valid log-prob (log 1). Alignment pads in generate-path
+        # LogProbs.full are NaN so earlier assistant turns inside the
+        # prompt cannot enter the importance ratio as fabricated scores.
+        # LLMMaskedCategorical.mask is read-only; keep the effective mask local.
+        attention_mask = dist.mask & torch.isfinite(prev_log_prob)
         cur_log_prob = torch.where(
             expand_as_right(attention_mask, cur_log_prob), cur_log_prob, 0.0
         )
@@ -947,7 +967,7 @@ class GRPOLoss(LossModule):
 
         tensordict.set("_cur_log_prob", cur_log_prob)
 
-        return log_weight, dist, kl_approx
+        return log_weight, dist, kl_approx, attention_mask
 
 
 class DAPO(GRPOLoss):

@@ -19,8 +19,10 @@ to compute observations and rewards.
 from __future__ import annotations
 
 import abc
+import functools as ft
 import importlib.util
 import urllib.request
+from collections.abc import Sequence
 from copy import copy
 from pathlib import Path
 from typing import Any, Literal
@@ -35,6 +37,15 @@ _has_mjx = _has_mujoco and importlib.util.find_spec("mujoco.mjx") is not None
 
 
 BackendName = Literal["mujoco-torch", "mjx", "mujoco"]
+ModelSource = str | Path
+
+
+def _load_mujoco_model(source: ModelSource):
+    import mujoco
+
+    if isinstance(source, Path):
+        return mujoco.MjModel.from_xml_path(str(source))
+    return mujoco.MjModel.from_xml_string(source)
 
 
 def _get_tensorclass_leaf(obj: Any, key: str | tuple[str, ...]) -> Any:
@@ -102,6 +113,16 @@ def resolve_xml_string(path_or_url: str | Path) -> str:
     return Path(p).read_text()
 
 
+def _batched_geom_contacts(
+    geom: torch.Tensor, dist: torch.Tensor, geom_ids: Sequence[int]
+) -> torch.Tensor:
+    """Reduce ``(num_envs, ncon, 2)`` contact pairs to per-geom contact flags."""
+    ids = torch.as_tensor(list(geom_ids), dtype=torch.long, device=geom.device)
+    active = (dist <= 0).unsqueeze(-1)
+    touching = (geom[..., :1] == ids) | (geom[..., 1:] == ids)
+    return (touching & active).any(dim=-2)
+
+
 class _PhysicsBackend(abc.ABC):
     """Common contract across the three engines.
 
@@ -121,17 +142,17 @@ class _PhysicsBackend(abc.ABC):
     actuator_ctrllimited: torch.Tensor
 
     def __init__(
-        self, xml_string: str, *, num_envs: int, device: torch.device | None
+        self, source: ModelSource, *, num_envs: int, device: torch.device | None
     ) -> None:
         self.num_envs = num_envs
         self.device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
-        self._init_model(xml_string)
+        self._init_model(source)
 
     @abc.abstractmethod
-    def _init_model(self, xml_string: str) -> None:
-        """Parse XML and prepare the batched data state.
+    def _init_model(self, source: ModelSource) -> None:
+        """Load the model source and prepare the batched data state.
 
         Populates ``nq, nv, nu, timestep, qpos0, qvel0, actuator_lo,
         actuator_hi`` from the parsed model.
@@ -184,6 +205,44 @@ class _PhysicsBackend(abc.ABC):
     def time(self) -> torch.Tensor:
         """Current simulation time per env, shape ``(num_envs,)``."""
 
+    @property
+    @abc.abstractmethod
+    def mj_model(self) -> Any:
+        """The compiled ``mujoco.MjModel`` this backend was built from."""
+
+    def geom_contacts(self, geom_ids: Sequence[int]) -> torch.Tensor:
+        """Whether each geom currently touches another geom.
+
+        A geom is in contact when it appears in an active contact whose
+        distance is non-positive, i.e. the geoms touch or penetrate.
+
+        Args:
+            geom_ids: MuJoCo geom ids to query.
+
+        Returns:
+            A ``(num_envs, len(geom_ids))`` boolean tensor on ``self.device``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not expose contacts.")
+
+    def site_positions(self, site_ids: Sequence[int]) -> torch.Tensor:
+        """World-frame positions of the requested sites.
+
+        Args:
+            site_ids: MuJoCo site ids to query.
+
+        Returns:
+            A ``(num_envs, len(site_ids), 3)`` float tensor on ``self.device``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose site positions."
+        )
+
+    def site_rotations(self, site_ids: Sequence[int]) -> torch.Tensor:
+        """World-frame site rotations, shaped ``(num_envs, sites, 3, 3)``."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose site rotations."
+        )
+
     def render(
         self,
         *,
@@ -232,7 +291,7 @@ class _TorchBackend(_PhysicsBackend):
 
     def __init__(
         self,
-        xml_string: str,
+        source: ModelSource,
         *,
         num_envs: int,
         device: torch.device | None,
@@ -246,13 +305,24 @@ class _TorchBackend(_PhysicsBackend):
             )
         self._compile_step = compile_step
         self._compile_kwargs = compile_kwargs or {}
-        super().__init__(xml_string, num_envs=num_envs, device=device)
+        super().__init__(source, num_envs=num_envs, device=device)
 
-    def _init_model(self, xml_string: str) -> None:
+    def _init_model(self, source: ModelSource) -> None:
         import mujoco
-        import mujoco_torch
 
-        m_mj = mujoco.MjModel.from_xml_string(xml_string)
+        try:
+            import mujoco_torch
+        except AttributeError as err:
+            # mujoco-torch mirrors MuJoCo enums at import time, so a release
+            # built for another MuJoCo version fails with an AttributeError.
+            raise ImportError(
+                "backend='mujoco-torch' could not import mujoco_torch against "
+                f"mujoco {mujoco.__version__}: {err}. Install a mujoco-torch "
+                "build that matches this MuJoCo version, or pass "
+                "backend='mjx' or backend='mujoco'."
+            ) from err
+
+        m_mj = _load_mujoco_model(source)
         d_mj = mujoco.MjData(m_mj)
         mujoco.mj_forward(m_mj, d_mj)
         self._m_mj = m_mj
@@ -266,6 +336,7 @@ class _TorchBackend(_PhysicsBackend):
         dx0 = mujoco_torch.step(mx, dx0)
 
         self._mx = mx
+        self._vmap_forward = torch.vmap(ft.partial(mujoco_torch.forward, mx))
         self._dx0 = dx0
         self._sim_dtype = dx0.qpos.dtype
         self._ctrl_dtype = dx0.ctrl.dtype
@@ -311,8 +382,14 @@ class _TorchBackend(_PhysicsBackend):
         # keep the frame_skip loop in Python. Compiling the unrolled loop
         # blows up the graph (50x more nodes), which sends inductor's
         # fusion analysis into multi-hour territory on CUDA backends.
+        #
+        # ``fullgraph=True`` by default: a graph break inside ``vmap(step)``
+        # would otherwise be papered over by splitting the step into eager
+        # fragments (and, once the recompile limit is hit, by falling back
+        # to eager entirely), silently discarding the compiled path.
         if self._compile_step:
-            base_compiled = torch.compile(base, **self._compile_kwargs)
+            compile_kwargs = {"fullgraph": True, **self._compile_kwargs}
+            base_compiled = torch.compile(base, **compile_kwargs)
 
             def _multi_step(d, frame_skip: int):
                 for _ in range(frame_skip):
@@ -335,6 +412,10 @@ class _TorchBackend(_PhysicsBackend):
         self._dx = self._dx0.expand(self.num_envs).clone()
         self._dx.qpos.copy_(qpos.to(self._sim_dtype))
         self._dx.qvel.copy_(qvel.to(self._sim_dtype))
+        # Forward may broadcast constant contact fields with stride-zero batch
+        # dimensions. Materialize them as in the stepped state, otherwise the
+        # first physics step changes strides and triggers recompilation.
+        self._dx = self._vmap_forward(self._dx).clone()
 
     def reset_mask(
         self, mask: torch.Tensor, qpos: torch.Tensor, qvel: torch.Tensor
@@ -345,6 +426,7 @@ class _TorchBackend(_PhysicsBackend):
         fresh = self._dx0.expand(self.num_envs).clone()
         fresh.qpos.copy_(qpos.to(self._sim_dtype))
         fresh.qvel.copy_(qvel.to(self._sim_dtype))
+        fresh = self._vmap_forward(fresh)
         # The simulator state contains both per-env tensors and 0-dim /
         # non-batched leaves shared across envs (``nefc``, ``ncon``,
         # ...). Mask only the batched ones; the shared scalars don't
@@ -421,6 +503,26 @@ class _TorchBackend(_PhysicsBackend):
             t = t.expand(self.num_envs)
         return t
 
+    @property
+    def mj_model(self) -> Any:
+        return self._m_mj
+
+    def geom_contacts(self, geom_ids: Sequence[int]) -> torch.Tensor:
+        contact = self._dx.contact
+        return _batched_geom_contacts(
+            contact.geom.to(self.device),
+            contact.dist.to(self.device),
+            geom_ids,
+        )
+
+    def site_positions(self, site_ids: Sequence[int]) -> torch.Tensor:
+        ids = torch.as_tensor(list(site_ids), dtype=torch.long, device=self.device)
+        return self._dx.site_xpos.to(self.device)[:, ids].to(torch.float32)
+
+    def site_rotations(self, site_ids: Sequence[int]) -> torch.Tensor:
+        ids = torch.as_tensor(list(site_ids), dtype=torch.long, device=self.device)
+        return self._dx.site_xmat.to(self.device)[:, ids].to(torch.float32)
+
     def render(
         self,
         *,
@@ -468,7 +570,7 @@ class _MujocoBackend(_PhysicsBackend):
 
     def __init__(
         self,
-        xml_string: str,
+        source: ModelSource,
         *,
         num_envs: int,
         device: torch.device | None,
@@ -485,12 +587,12 @@ class _MujocoBackend(_PhysicsBackend):
                 "(MujocoEnv does this automatically when num_workers>1 "
                 "or num_envs>1 is passed)."
             )
-        super().__init__(xml_string, num_envs=num_envs, device=device)
+        super().__init__(source, num_envs=num_envs, device=device)
 
-    def _init_model(self, xml_string: str) -> None:
+    def _init_model(self, source: ModelSource) -> None:
         import mujoco
 
-        m_mj = mujoco.MjModel.from_xml_string(xml_string)
+        m_mj = _load_mujoco_model(source)
         d_mj = mujoco.MjData(m_mj)
         mujoco.mj_forward(m_mj, d_mj)
 
@@ -582,6 +684,37 @@ class _MujocoBackend(_PhysicsBackend):
     def time(self) -> torch.Tensor:
         return torch.tensor([self._d.time], device=self.device, dtype=torch.float32)
 
+    @property
+    def mj_model(self) -> Any:
+        return self._m
+
+    def geom_contacts(self, geom_ids: Sequence[int]) -> torch.Tensor:
+        ncon = int(self._d.ncon)
+        geom = torch.as_tensor(
+            np.stack(
+                (self._d.contact.geom1[:ncon], self._d.contact.geom2[:ncon]), axis=-1
+            ).reshape(1, ncon, 2),
+            device=self.device,
+        )
+        dist = torch.as_tensor(
+            self._d.contact.dist[:ncon].reshape(1, ncon), device=self.device
+        )
+        return _batched_geom_contacts(geom, dist, geom_ids)
+
+    def site_positions(self, site_ids: Sequence[int]) -> torch.Tensor:
+        return torch.as_tensor(
+            self._d.site_xpos[list(site_ids)].copy(),
+            device=self.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+
+    def site_rotations(self, site_ids: Sequence[int]) -> torch.Tensor:
+        return torch.as_tensor(
+            self._d.site_xmat[list(site_ids)].copy(),
+            device=self.device,
+            dtype=torch.float32,
+        ).reshape(1, len(site_ids), 3, 3)
+
     def render(
         self,
         *,
@@ -645,7 +778,7 @@ class _MJXBackend(_PhysicsBackend):
 
     def __init__(
         self,
-        xml_string: str,
+        source: ModelSource,
         *,
         num_envs: int,
         device: torch.device | None,
@@ -655,14 +788,13 @@ class _MJXBackend(_PhysicsBackend):
                 "backend='mjx' requires `mujoco>=3.0` (with mjx) and `jax`. "
                 "Install with `pip install mujoco-mjx jax`."
             )
-        super().__init__(xml_string, num_envs=num_envs, device=device)
+        super().__init__(source, num_envs=num_envs, device=device)
 
-    def _init_model(self, xml_string: str) -> None:
+    def _init_model(self, source: ModelSource) -> None:
         import jax
-        import mujoco
         from mujoco import mjx
 
-        m_mj = mujoco.MjModel.from_xml_string(xml_string)
+        m_mj = _load_mujoco_model(source)
         mx = mjx.put_model(m_mj)
         dx0_single = mjx.make_data(mx)
         dx0_single = mjx.forward(mx, dx0_single)
@@ -815,6 +947,24 @@ class _MJXBackend(_PhysicsBackend):
     def time(self) -> torch.Tensor:
         return self._jax_to_torch(self._dx.time)
 
+    @property
+    def mj_model(self) -> Any:
+        return self._m_mj
+
+    def geom_contacts(self, geom_ids: Sequence[int]) -> torch.Tensor:
+        from torchrl.envs.libs.jax_utils import _ndarray_to_tensor
+
+        contact = self._dx.contact
+        geom = _ndarray_to_tensor(contact.geom).to(self.device)
+        dist = _ndarray_to_tensor(contact.dist).to(self.device)
+        return _batched_geom_contacts(geom, dist, geom_ids)
+
+    def site_positions(self, site_ids: Sequence[int]) -> torch.Tensor:
+        return self._jax_to_torch(self._dx.site_xpos[:, list(site_ids)])
+
+    def site_rotations(self, site_ids: Sequence[int]) -> torch.Tensor:
+        return self._jax_to_torch(self._dx.site_xmat[:, list(site_ids)])
+
     def render(
         self,
         *,
@@ -860,7 +1010,7 @@ class _MJXBackend(_PhysicsBackend):
 
 def make_backend(
     name: BackendName,
-    xml_string: str,
+    source: ModelSource,
     *,
     num_envs: int,
     device: torch.device | None,
@@ -876,16 +1026,16 @@ def make_backend(
     """
     if name == "mujoco-torch":
         return _TorchBackend(
-            xml_string,
+            source,
             num_envs=num_envs,
             device=device,
             compile_step=compile_step,
             compile_kwargs=compile_kwargs,
         )
     if name == "mjx":
-        return _MJXBackend(xml_string, num_envs=num_envs, device=device)
+        return _MJXBackend(source, num_envs=num_envs, device=device)
     if name == "mujoco":
-        return _MujocoBackend(xml_string, num_envs=num_envs, device=device)
+        return _MujocoBackend(source, num_envs=num_envs, device=device)
     raise ValueError(
         f"unknown backend {name!r}; expected one of 'mujoco-torch', 'mjx', 'mujoco'"
     )

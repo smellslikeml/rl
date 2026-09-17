@@ -321,6 +321,23 @@ class TestRanges:
             projection[..., 0] = -1
         assert not ts.is_in(projection)
 
+    @pytest.mark.parametrize(
+        "dtype", [torch.float32, torch.int64, torch.uint8, torch.bool]
+    )
+    @pytest.mark.parametrize(
+        "nvec, value, expected",
+        [
+            (3, -2, 0),
+            ([3, 2, 4], [[-1, 1, 6], [2, -3, -4]], [[0, 1, 3], [2, 0, 0]]),
+            ([[2, 4], [3, 2]], [[-1, 8], [5, -2]], [[0, 3], [2, 0]]),
+        ],
+    )
+    def test_multi_discrete_project_out_of_bounds(self, dtype, nvec, value, expected):
+        spec = MultiCategorical(nvec, dtype=dtype)
+        projected = spec.project(torch.tensor(value))
+        torch.testing.assert_close(projected, torch.tensor(expected, dtype=dtype))
+        assert spec.is_in(projected)
+
     @pytest.mark.parametrize("n", [1, 4, 7, 99])
     @pytest.mark.parametrize("device", get_default_devices())
     @pytest.mark.parametrize("shape", [None, [], [1], [1, 2]])
@@ -837,6 +854,32 @@ class TestLock:
         spec["a"] = spec["a"].clone()
         spec["a", "b"] = spec["a", "b"].clone()
         spec["a"].set("b", spec["a", "b"].clone())
+
+    def test_stacked_composite_lock_propagates_to_children(self):
+        """Lock state must propagate through lazy stacks to the stacked children.
+
+        Regression test: the children hold the authoritative state and writes
+        through the stack go to them, so a child that was locked when stacked
+        (e.g. env specs shipped by AsyncEnvPool workers) made every write fail
+        even after ``unlock_(recurse=True)`` on the stack.
+        """
+        child_a = Composite(x=Unbounded((3,)))
+        child_b = Composite(x=Unbounded((4,)))
+        child_a.lock_(recurse=True)
+        child_b.lock_(recurse=True)
+        stacked = torch.stack([child_a, child_b], 0)
+
+        stacked.unlock_(recurse=True)
+        assert not child_a.locked
+        assert not child_b.locked
+        stacked["y"] = Unbounded((2, 5))
+        assert child_a["y"].shape == torch.Size((5,))
+
+        stacked.lock_(recurse=True)
+        assert child_a.locked
+        assert child_b.locked
+        with pytest.raises(RuntimeError, match="Cannot modify a locked Composite."):
+            stacked["z"] = Unbounded((2, 5))
 
     def test_edge_cases(self):
         level3 = Composite()

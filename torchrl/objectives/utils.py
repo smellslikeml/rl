@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import functools
 import importlib
+
+import math
 import re
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from copy import copy
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
 from tensordict import NestedKey, TensorDict, TensorDictBase, unravel_key
@@ -30,6 +32,9 @@ except ImportError as err:
         raise err_ft from err
 from torchrl._utils import implement_for
 from torchrl.envs.utils import step_mdp
+
+if TYPE_CHECKING:
+    from torchrl.objectives.common import LossModule
 
 try:
     from torch.compiler import is_dynamo_compiling
@@ -365,16 +370,22 @@ def distance_loss(
 
 
 class TargetNetUpdater:
-    """An abstract class for target network update in Double DQN/DDPG.
+    """Base class for updating target parameters owned by a loss module.
+
+    The updater discovers ``target_*_params`` children on the loss module and
+    matches each one with its corresponding source ``*_params`` child. Losses
+    can therefore use this updater for delayed actors, values, or any other
+    explicitly separated target parameters.
 
     Args:
-        loss_module (DQNLoss or DDPGLoss): loss module where the target network should be updated.
+        loss_module (LossModule): loss module whose target parameters should be
+            updated.
 
     """
 
     def __init__(
         self,
-        loss_module: LossModule,  # noqa: F821
+        loss_module: LossModule,
     ):
         from torchrl.objectives.common import LossModule
 
@@ -460,7 +471,7 @@ class TargetNetUpdater:
             self._distinct_and_params[key] = (
                 target.is_leaf
                 and source.requires_grad
-                and target.data_ptr() != source.data.data_ptr()
+                and not target.is_set_to(source.data)
             )
             found_distinct = found_distinct or self._distinct_and_params[key]
             target.data.copy_(source.data)
@@ -468,8 +479,9 @@ class TargetNetUpdater:
             raise RuntimeError(
                 f"The target and source data are identical for all params. "
                 "Have you created proper target parameters? "
-                "If the loss has a ``delay_value`` kwarg, make sure to set it "
-                "to True if it is not done by default. "
+                "If the loss supports delayed parameters, make sure to enable "
+                "the corresponding argument (for example, ``delay_value=True`` "
+                "or ``delay_actor=True``). "
                 f"If no target parameter is needed, do not use a target updater such as {type(self)}."
             )
 
@@ -499,6 +511,8 @@ class TargetNetUpdater:
                 f"{self.__class__.__name__} must be "
                 f"initialized (`{self.__class__.__name__}.init_()`) before calling step()"
             )
+        for name in self._target_names:
+            getattr(self.loss_module, name)
         for key, param in self._sources.items():
             target = self._targets.get(f"target_{key}")
             if target.requires_grad:
@@ -530,14 +544,15 @@ class TargetNetUpdater:
 
 
 class SoftUpdate(TargetNetUpdater):
-    r"""A soft-update class for target network update in Double DQN/DDPG.
+    r"""Soft-update target parameters toward their source parameters.
 
     This was proposed in "CONTINUOUS CONTROL WITH DEEP REINFORCEMENT LEARNING", https://arxiv.org/pdf/1509.02971.pdf
 
     One and only one decay factor (tau or eps) must be specified.
 
     Args:
-        loss_module (DQNLoss or DDPGLoss): loss module where the target network should be updated.
+        loss_module (LossModule): loss module whose target parameters should be
+            updated.
         eps (scalar): epsilon in the update equation:
             .. math::
 
@@ -545,17 +560,22 @@ class SoftUpdate(TargetNetUpdater):
 
             Exclusive with ``tau``.
         tau (scalar): Polyak tau. It is equal to ``1-eps``, and exclusive with it.
+
+    Examples:
+        PPO-EWMA uses a delayed actor as its proximal policy and updates it
+        after each optimizer step:
+
+        >>> from torchrl.objectives import ClipPPOLoss, SoftUpdate
+        >>> loss_module = ClipPPOLoss(  # doctest: +SKIP
+        ...     actor, critic, delay_actor=True
+        ... )
+        >>> updater = SoftUpdate(loss_module, eps=0.889)  # doctest: +SKIP
+        >>> updater.step()  # doctest: +SKIP
     """
 
     def __init__(
         self,
-        loss_module: (
-            DQNLoss  # noqa: F821
-            | DDPGLoss  # noqa: F821
-            | SACLoss  # noqa: F821
-            | REDQLoss  # noqa: F821
-            | TD3Loss  # noqa: F821  # noqa: F821
-        ),
+        loss_module: LossModule,
         *,
         eps: float | None = None,
         tau: float | None = None,
@@ -589,13 +609,14 @@ class SoftUpdate(TargetNetUpdater):
 
 
 class HardUpdate(TargetNetUpdater):
-    """A hard-update class for target network update in Double DQN/DDPG (by contrast with soft updates).
+    """Periodically copy source parameters into their target parameters.
 
     This was proposed in the original Double DQN paper: "Deep Reinforcement Learning with Double Q-learning",
     https://arxiv.org/abs/1509.06461.
 
     Args:
-        loss_module (DQNLoss or DDPGLoss): loss module where the target network should be updated.
+        loss_module (LossModule): loss module whose target parameters should be
+            updated.
 
     Keyword Args:
         value_network_update_interval (scalar): how often the target network should be updated.
@@ -604,7 +625,7 @@ class HardUpdate(TargetNetUpdater):
 
     def __init__(
         self,
-        loss_module: DQNLoss | DDPGLoss | SACLoss | TD3Loss,  # noqa: F821
+        loss_module: LossModule,
         *,
         value_network_update_interval: float = 1000,
     ):
@@ -622,6 +643,122 @@ class HardUpdate(TargetNetUpdater):
             self.counter = 0
         else:
             self.counter += 1
+
+
+class KLAdaptiveLR:
+    """Adapt an optimizer's learning rate to a target policy KL divergence.
+
+    After each policy update, compare the measured mean KL divergence between
+    the old and the new policy with ``target_kl``: when it exceeds
+    ``2 * target_kl`` the learning rate is divided by ``factor``, when it is
+    positive but below ``target_kl / 2`` it is multiplied by ``factor``, and it
+    is left unchanged in between. The learning rate of every parameter group is
+    clamped to ``[min_lr, max_lr]``. A KL of exactly zero leaves the learning
+    rate unchanged, so a policy that did not move does not trigger runaway
+    growth.
+
+    This is the schedule used by the ``rsl_rl`` PPO implementation (Rudin et
+    al., "Learning to Walk in Minutes Using Massively Parallel Deep
+    Reinforcement Learning", https://arxiv.org/abs/2109.11978). The
+    ``kl_approx`` output of :class:`~torchrl.objectives.ClipPPOLoss` can be
+    passed directly to :meth:`step`.
+
+    Args:
+        optimizer (torch.optim.Optimizer): optimizer whose parameter groups are
+            rescaled in place.
+        target_kl (float): desired mean KL divergence per update.
+
+    Keyword Args:
+        factor (float, optional): multiplicative change applied when the KL
+            leaves the ``[target_kl / 2, 2 * target_kl]`` band. Must be greater
+            than one. Defaults to ``1.5``.
+        min_lr (float, optional): lower bound of the learning rate. Defaults to
+            ``1e-5``.
+        max_lr (float, optional): upper bound of the learning rate. Defaults to
+            ``1e-2``.
+
+    Examples:
+        >>> import torch
+        >>> from torchrl.objectives import KLAdaptiveLR
+        >>> params = [torch.nn.Parameter(torch.zeros(1))]
+        >>> optimizer = torch.optim.Adam(params, lr=1e-3)
+        >>> scheduler = KLAdaptiveLR(optimizer, target_kl=0.01, factor=2.0)
+        >>> scheduler.step(kl=0.05)  # the update was too large: halve the lr
+        >>> optimizer.param_groups[0]["lr"]
+        0.0005
+        >>> scheduler.step(kl=0.001)  # the update was too small: double it
+        >>> optimizer.param_groups[0]["lr"]
+        0.001
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        target_kl: float,
+        *,
+        factor: float = 1.5,
+        min_lr: float = 1e-5,
+        max_lr: float = 1e-2,
+    ):
+        if not math.isfinite(target_kl) or target_kl <= 0:
+            raise ValueError(f"target_kl must be finite and positive, got {target_kl}.")
+        if not math.isfinite(factor) or factor <= 1.0:
+            raise ValueError(
+                f"factor must be finite and greater than one, got {factor}."
+            )
+        if not (0 < min_lr <= max_lr) or not math.isfinite(max_lr):
+            raise ValueError(
+                f"Expected 0 < min_lr <= max_lr < inf, got min_lr={min_lr} and "
+                f"max_lr={max_lr}."
+            )
+        self.optimizer = optimizer
+        self.target_kl = float(target_kl)
+        self.factor = float(factor)
+        self.min_lr = float(min_lr)
+        self.max_lr = float(max_lr)
+        self.last_kl: float | None = None
+
+    def step(self, kl: float | Tensor) -> None:
+        """Rescale the learning rate from the KL divergence of the last update.
+
+        Args:
+            kl (float or Tensor): mean KL divergence between the policy before
+                and after the update. A zero-dimensional tensor is accepted.
+        """
+        kl = float(kl)
+        if not math.isfinite(kl):
+            raise ValueError(f"The KL divergence must be finite, got {kl}.")
+        if kl > 2.0 * self.target_kl:
+            scale = 1.0 / self.factor
+        elif 0.0 < kl < 0.5 * self.target_kl:
+            scale = self.factor
+        else:
+            scale = 1.0
+        for group in self.optimizer.param_groups:
+            group["lr"] = min(self.max_lr, max(self.min_lr, group["lr"] * scale))
+        self.last_kl = kl
+
+    def get_last_lr(self) -> list[float]:
+        """Return the current learning rate of each parameter group."""
+        return [float(group["lr"]) for group in self.optimizer.param_groups]
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the scheduler state, excluding the optimizer."""
+        return {
+            "target_kl": self.target_kl,
+            "factor": self.factor,
+            "min_lr": self.min_lr,
+            "max_lr": self.max_lr,
+            "last_kl": self.last_kl,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Load a state produced by :meth:`state_dict`."""
+        self.target_kl = float(state_dict["target_kl"])
+        self.factor = float(state_dict["factor"])
+        self.min_lr = float(state_dict["min_lr"])
+        self.max_lr = float(state_dict["max_lr"])
+        self.last_kl = state_dict.get("last_kl")
 
 
 class hold_out_net(_context_manager):
@@ -1052,3 +1189,30 @@ def _maybe_add_or_extend_key(
         tensor_keys.append(key_or_list_of_keys)
     else:
         tensor_keys.extend(key_or_list_of_keys)
+
+
+def _valid_value_target_rows(
+    value_target: torch.Tensor,
+    tensordict: TensorDictBase,
+    mask_keys: Iterable[NestedKey],
+) -> torch.Tensor:
+    """Drop value-target rows marked invalid by the validity masks.
+
+    Looks up every mask key found in ``tensordict`` (the same convention as
+    :meth:`LossModule._reduce_loss`), ANDs them, and returns only the rows
+    where the combined mask is ``True``. Padding or boundary-crossing rows
+    would otherwise pollute running value statistics.
+    """
+    mask = None
+    for mask_key in mask_keys:
+        entry = tensordict.get(mask_key, default=None)
+        if entry is None:
+            continue
+        entry = entry.bool()
+        # Validity masks conventionally carry a trailing singleton dimension.
+        while entry.ndim >= value_target.ndim and entry.shape[-1] == 1:
+            entry = entry.squeeze(-1)
+        mask = entry if mask is None else mask & entry
+    if mask is None:
+        return value_target
+    return value_target[mask]

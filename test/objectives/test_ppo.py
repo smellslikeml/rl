@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import itertools
+import sys
 from dataclasses import asdict
 
 import pytest
@@ -20,8 +21,7 @@ from _objectives_common import (
     MARLEnv,
 )
 
-from packaging import version as pack_version
-from tensordict import assert_allclose_td, TensorDict
+from tensordict import assert_allclose_td, is_tensor_collection, TensorDict
 from tensordict.nn import (
     composite_lp_aggregate,
     CompositeDistribution,
@@ -37,7 +37,7 @@ from tensordict.nn import (
     TensorDictSequential as Seq,
     WrapModule,
 )
-from torch import autograd, nn
+from torch import autograd, distributions as d, nn
 
 from torchrl._utils import rl_warnings
 from torchrl.data import Bounded, Composite, Unbounded
@@ -48,7 +48,15 @@ from torchrl.modules.tensordict_module.actors import (
     ProbabilisticActor,
     ValueOperator,
 )
-from torchrl.objectives import A2CLoss, ClipPPOLoss, KLPENPPOLoss, PPOLoss
+from torchrl.modules.value_norm import PercentileValueNorm
+from torchrl.objectives import (
+    A2CLoss,
+    ClipPPOLoss,
+    KLAdaptiveLR,
+    KLPENPPOLoss,
+    PPOLoss,
+    SoftUpdate,
+)
 from torchrl.objectives.reinforce import ReinforceLoss
 from torchrl.objectives.utils import _sum_td_features, ValueEstimators
 from torchrl.objectives.value.advantages import (
@@ -65,6 +73,36 @@ from torchrl.testing import (  # noqa
     get_default_devices,
     PENDULUM_VERSIONED,
 )
+
+
+class _NormalWithoutEntropy(d.Normal):
+    """Normal that keeps the base ``Distribution.entropy`` stub."""
+
+    entropy = d.Distribution.entropy
+
+
+class _NormalWithNonfiniteEntropy(d.Normal):
+    """Normal with an unusable analytic entropy implementation."""
+
+    def entropy(self):
+        return torch.full_like(self.loc, float("nan"))
+
+
+def _analytic_entropy_case(kind: str) -> tuple[d.Distribution, torch.Tensor]:
+    if kind == "normal":
+        loc = torch.zeros(3, 4)
+        scale = torch.ones(3, 4)
+        dist = d.Normal(loc, scale)
+        return dist, dist.entropy()
+    if kind == "independent":
+        loc = torch.zeros(3, 4)
+        scale = torch.ones(3, 4)
+        dist = d.Independent(d.Normal(loc, scale), 1)
+        return dist, dist.entropy()
+    if kind == "categorical":
+        dist = d.Categorical(logits=torch.zeros(3, 5))
+        return dist, dist.entropy()
+    raise ValueError(kind)
 
 
 @pytest.mark.skipif(not _has_transformers, reason="requires transformers lib")
@@ -1322,6 +1360,10 @@ class TestPPO(LossModuleTestBase):
         value = self._create_mock_value()
         advantage = GAE(gamma=0.9, lmbda=0.9, value_network=value)
         advantage(td)
+        with torch.no_grad():
+            current_log_prob = actor.get_dist(td).log_prob(td["action"])
+        td["action_log_prob"] = current_log_prob - torch.tensor(1.25).log()
+        td["advantage"] = torch.ones_like(td["advantage"])
 
         loss_sym = ClipPPOLoss(actor, value, clip_epsilon=0.2)
         loss_asym = ClipPPOLoss(actor, value, clip_epsilon=(0.2, 0.28))
@@ -1343,8 +1385,11 @@ class TestPPO(LossModuleTestBase):
         torch.manual_seed(self.seed)
         out_eq = loss_eq(td.clone())
         torch.testing.assert_close(out_sym["loss_objective"], out_eq["loss_objective"])
-        # the asymmetric loss runs end-to-end
-        loss_asym(td.clone())
+        out_asym = loss_asym(td.clone())
+        torch.testing.assert_close(out_sym["loss_objective"], torch.tensor(-1.2))
+        torch.testing.assert_close(out_asym["loss_objective"], torch.tensor(-1.25))
+        torch.testing.assert_close(out_sym["clip_fraction"], torch.tensor(1.0))
+        torch.testing.assert_close(out_asym["clip_fraction"], torch.tensor(0.0))
 
         # both buffer flavors accept scheduled scalar assignment
         loss_sym.clip_epsilon = 0.1
@@ -1370,6 +1415,220 @@ class TestPPO(LossModuleTestBase):
             ClipPPOLoss(actor, value, clip_epsilon=(1.0, 0.2))
         with pytest.raises(ValueError, match="clip_value=True"):
             ClipPPOLoss(actor, value, clip_epsilon=(0.2, 0.28), clip_value=True)
+
+    @pytest.mark.parametrize("composite_action_dist", [False, True])
+    def test_ppo_decoupled_proximal_policy(self, composite_action_dist):
+        # delay_actor=True: the clipping acts on r = pi_theta / pi_prox, with
+        # pi_prox running on the target params, and the surrogate is
+        # re-weighted by pi_prox / pi_behav (decoupled clipped objective of
+        # Hilton et al. 2021, https://arxiv.org/abs/2110.00641)
+        torch.manual_seed(self.seed)
+        batch = 16
+        td = self._create_mock_data_ppo(
+            batch=batch, composite_action_dist=composite_action_dist
+        )
+        actor = self._create_mock_actor(composite_action_dist=composite_action_dist)
+        value = self._create_mock_value()
+        advantage = torch.randn(batch, 1)
+        td["advantage"] = advantage
+        td["value_target"] = torch.randn(batch, 1)
+        if composite_action_dist:
+            action = td.select(("action", "action1"))
+            lp_key = ("action", "action1_log_prob")
+        else:
+            action = td["action"]
+            lp_key = "action_log_prob"
+
+        def make_loss(**kwargs):
+            loss = ClipPPOLoss(
+                actor, value, clip_epsilon=0.2, entropy_bonus=False, **kwargs
+            )
+            if composite_action_dist:
+                loss.set_keys(action=("action", "action1"), sample_log_prob=[lp_key])
+            return loss
+
+        def log_prob_with(params):
+            with torch.no_grad(), params.to_module(actor, preserve_module_state=False):
+                lp = actor.get_dist(td.clone()).log_prob(action)
+            return _sum_td_features(lp) if is_tensor_collection(lp) else lp
+
+        def decoupled_objective(lp_cur, lp_prox, lp_behav):
+            ratio = (lp_cur - lp_prox).exp().unsqueeze(-1)
+            weight = (lp_prox - lp_behav).exp().unsqueeze(-1)
+            gain = torch.minimum(ratio * advantage, ratio.clamp(0.8, 1.2) * advantage)
+            return -(weight * gain).mean()
+
+        loss_fn = make_loss(delay_actor=True)
+        # only the actor gets a proximal copy
+        assert "target_actor_network_params" in dict(loss_fn.named_children())
+        assert "target_critic_network_params" not in dict(loss_fn.named_children())
+        updater = SoftUpdate(loss_fn, eps=0.5)
+        # move the policy away from the proximal snapshot taken at construction
+        with torch.no_grad():
+            for p in actor.parameters():
+                p.add_(0.5 * torch.randn_like(p))
+        lp_cur = log_prob_with(loss_fn.actor_network_params)
+        lp_prox = log_prob_with(loss_fn.target_actor_network_params)
+        assert not torch.allclose(lp_cur, lp_prox)
+
+        # proximal == behavior policy: the decoupled loss is the standard one
+        td[lp_key] = lp_prox
+        out = loss_fn(td.clone())
+        out_std = make_loss()(td.clone())
+        for key in (
+            "loss_objective",
+            "clip_fraction",
+            "ESS",
+            "kl_approx",
+            "max_ratio",
+            "mean_ratio",
+        ):
+            torch.testing.assert_close(out[key], out_std[key], msg=key)
+
+        # proximal != behavior policy: hand-computed decoupled objective
+        lp_behav = lp_prox - 0.3 * torch.randn(batch)
+        td[lp_key] = lp_behav
+        out = loss_fn(td.clone())
+        torch.testing.assert_close(
+            out["loss_objective"], decoupled_objective(lp_cur, lp_prox, lp_behav)
+        )
+        ratio = (lp_cur - lp_prox).exp()
+        torch.testing.assert_close(
+            out["clip_fraction"], ((ratio < 0.8) | (ratio > 1.2)).float().mean()
+        )
+        torch.testing.assert_close(out["kl_approx"], (lp_prox - lp_cur).mean())
+        # the ratio statistics describe the weights the data is multiplied by
+        torch.testing.assert_close(out["mean_ratio"], (lp_cur - lp_behav).exp().mean())
+
+        # stepping the updater moves the proximal policy and the loss follows
+        source_before = loss_fn.actor_network_params.clone()
+        target_before = loss_fn.target_actor_network_params.clone()
+        updater.step()
+        for key, target_after in loss_fn.target_actor_network_params.items(True, True):
+            torch.testing.assert_close(
+                target_after,
+                target_before.get(key).lerp(source_before.get(key), 0.5),
+            )
+        lp_prox_new = log_prob_with(loss_fn.target_actor_network_params)
+        assert not torch.allclose(lp_prox_new, lp_prox)
+        torch.testing.assert_close(
+            loss_fn(td.clone())["loss_objective"],
+            decoupled_objective(lp_cur, lp_prox_new, lp_behav),
+        )
+
+    def test_ppo_max_importance_ratio(self):
+        # the behavior ratio pi_theta / pi_behav is capped at max_importance_ratio
+        # by lifting the detached behavior log-prob: a capped sample keeps a
+        # policy gradient (scaled by the cap) rather than the zero gradient a
+        # clamp on the ratio would give
+        torch.manual_seed(self.seed)
+        batch = 4
+        td = self._create_mock_data_ppo(batch=batch)
+        actor = self._create_mock_actor()
+        value = self._create_mock_value()
+        td["value_target"] = torch.randn(batch, 1)
+        with torch.no_grad():
+            lp_orig = actor.get_dist(td.clone()).log_prob(td["action"])
+        td["action_log_prob"] = lp_orig - torch.tensor(10.0).log()  # ratio = 10
+        with pytest.raises(ValueError, match="max_importance_ratio"):
+            ClipPPOLoss(actor, value, max_importance_ratio=0.0)
+        loss_capped = ClipPPOLoss(
+            actor, value, entropy_bonus=False, max_importance_ratio=4.0
+        )
+        loss_plain = ClipPPOLoss(actor, value, entropy_bonus=False)
+        tol = {"rtol": 1e-4, "atol": 1e-4}
+
+        # negative advantage: the unclipped branch is selected
+        td["advantage"] = -torch.ones(batch, 1)
+        torch.testing.assert_close(
+            loss_plain(td.clone())["loss_objective"], torch.tensor(10.0), **tol
+        )
+        out = loss_capped(td.clone())
+        torch.testing.assert_close(out["loss_objective"], torch.tensor(4.0), **tol)
+        torch.testing.assert_close(out["max_ratio"], torch.tensor(4.0), **tol)
+        out["loss_objective"].backward()
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in actor.parameters()
+        )
+        # positive advantage: the clipped branch is selected, 1.2 * 4 / 10
+        td["advantage"] = torch.ones(batch, 1)
+        torch.testing.assert_close(
+            loss_plain(td.clone())["loss_objective"], torch.tensor(-1.2), **tol
+        )
+        torch.testing.assert_close(
+            loss_capped(td.clone())["loss_objective"], torch.tensor(-0.48), **tol
+        )
+
+        # with a decoupled proximal policy the cap acts on the total ratio
+        # pi_theta / pi_behav = r * (pi_prox / pi_behav)
+        loss_dec = ClipPPOLoss(
+            actor,
+            value,
+            entropy_bonus=False,
+            delay_actor=True,
+            max_importance_ratio=4.0,
+        )
+        SoftUpdate(loss_dec, eps=0.9)
+        with torch.no_grad():
+            for p in actor.parameters():
+                p.add_(0.5 * torch.randn_like(p))
+            lp_cur = actor.get_dist(td.clone()).log_prob(td["action"])
+        advantage = torch.randn(batch, 1)
+        td["advantage"] = advantage
+        ratio = (lp_cur - lp_orig).exp().unsqueeze(-1)
+        weight = torch.minimum(torch.tensor(10.0), 4.0 / ratio)
+        gain = torch.minimum(
+            ratio * weight * advantage, ratio.clamp(0.8, 1.2) * weight * advantage
+        )
+        torch.testing.assert_close(
+            loss_dec(td.clone())["loss_objective"], -gain.mean(), **tol
+        )
+
+    def test_ppo_kl_pen_decoupled_proximal_policy(self):
+        # delay_actor=True: the KL penalty is measured against the proximal
+        # policy held in the target params rather than against the behavior
+        # distribution parameters stored in the data, while the surrogate keeps
+        # the behavior ratio pi_theta / pi_behav
+        torch.manual_seed(self.seed)
+        batch = 16
+        td = self._create_mock_data_ppo(batch=batch)
+        actor = self._create_mock_actor()
+        value = self._create_mock_value()
+        advantage = torch.randn(batch, 1)
+        td["advantage"] = advantage
+        td["value_target"] = torch.randn(batch, 1)
+        loss_fn = KLPENPPOLoss(
+            actor, value, entropy_bonus=False, beta=1.0, delay_actor=True
+        )
+        SoftUpdate(loss_fn, eps=0.9)
+        with torch.no_grad():
+            for p in actor.parameters():
+                p.add_(0.5 * torch.randn_like(p))
+            dist_cur = actor.get_dist(td.clone())
+            lp_cur = dist_cur.log_prob(td["action"])
+            with loss_fn.target_actor_network_params.to_module(
+                actor, preserve_module_state=False
+            ):
+                dist_prox = actor.get_dist(td.clone())
+            lp_prox = dist_prox.log_prob(td["action"])
+            kl = torch.distributions.kl.kl_divergence(dist_prox, dist_cur)
+        lp_behav = lp_prox - 0.3 * torch.randn(batch)
+        td["action_log_prob"] = lp_behav
+        # the behavior distribution parameters stored in the data are far off
+        # and must not enter the penalty
+        td["loc"] = td["loc"] + 100.0
+        out = loss_fn(td.clone())
+        torch.testing.assert_close(out["kl"], kl.unsqueeze(-1))
+        ratio_behav = (lp_cur - lp_behav).exp().unsqueeze(-1)
+        torch.testing.assert_close(
+            out["loss_objective"], -(ratio_behav * advantage - kl.unsqueeze(-1)).mean()
+        )
+
+    def test_ppo_delay_actor_requires_functional(self):
+        actor = self._create_mock_actor()
+        value = self._create_mock_value()
+        with pytest.raises(ValueError, match="functional=True"):
+            ClipPPOLoss(actor, value, delay_actor=True, functional=False)
 
     @pytest.mark.parametrize("loss_class", (PPOLoss, ClipPPOLoss, KLPENPPOLoss))
     def test_ppo_flat_advantage_raises(self, loss_class):
@@ -1693,6 +1952,130 @@ class TestPPO(LossModuleTestBase):
         assert isinstance(clip_fraction, TensorDict)
         assert isinstance(explained_variance, TensorDict)
 
+    @pytest.mark.parametrize("loss_class", (PPOLoss, ClipPPOLoss, KLPENPPOLoss))
+    def test_ppo_advantage_norm(self, loss_class):
+        """advantage_norm must update once on the freshly computed value target
+        and divide the advantage by the resulting scale (no re-centering)."""
+        torch.manual_seed(self.seed)
+        td = self._create_mock_data_ppo()
+        actor = self._create_mock_actor()
+        value = self._create_mock_value()
+
+        norm = PercentileValueNorm(shape=1, rate=1.0, min_scale=1e-6)
+        loss_fn = loss_class(actor, value, advantage_norm=norm)
+
+        # Independent probe of the value target the estimator will produce.
+        probe = loss_class(actor, value)
+        td_probe = td.clone()
+        probe.value_estimator(
+            td_probe,
+            params=probe._cached_critic_network_params_detached,
+            target_params=probe.target_critic_network_params,
+        )
+        expected_low, expected_high = torch.quantile(
+            td_probe.get("value_target").reshape(-1), torch.tensor([0.05, 0.95])
+        )
+        loss_fn(td.clone())
+        torch.testing.assert_close(norm.low, expected_low.reshape(1))
+        torch.testing.assert_close(norm.high, expected_high.reshape(1))
+
+        # A precomputed advantage is scaled by the frozen statistics without
+        # updating them (the fresh loss shares the same norm module).
+        advantage = torch.randn(td.batch_size[0], 1)
+        value_target = 100 * torch.rand(td.batch_size[0], 1)
+        td_pre = td.clone()
+        td_pre.set("advantage", advantage)
+        td_pre.set("value_target", value_target)
+        loss_pre_fn = loss_class(actor, value, advantage_norm=norm)
+        loss_scaled = loss_pre_fn(td_pre)
+        torch.testing.assert_close(norm.low, expected_low.reshape(1))
+        torch.testing.assert_close(norm.high, expected_high.reshape(1))
+
+        scale = (expected_high - expected_low).clamp_min(1e-6)
+        loss_ref_fn = loss_class(actor, value)
+        td_ref = td.clone()
+        td_ref.set("advantage", advantage / scale)
+        td_ref.set("value_target", value_target)
+        loss_ref = loss_ref_fn(td_ref)
+        torch.testing.assert_close(
+            loss_scaled["loss_objective"], loss_ref["loss_objective"]
+        )
+
+    def test_ppo_advantage_norm_eval_mode_keeps_statistics(self):
+        torch.manual_seed(self.seed)
+        td = self._create_mock_data_ppo()
+        norm = PercentileValueNorm(shape=1)
+        loss_fn = ClipPPOLoss(
+            self._create_mock_actor(), self._create_mock_value(), advantage_norm=norm
+        )
+        loss_fn.eval()
+        loss_fn(td)
+        torch.testing.assert_close(norm.low, torch.zeros(1))
+        torch.testing.assert_close(norm.high, torch.zeros(1))
+
+    def test_ppo_advantage_norm_exclusive_with_normalize_advantage(self):
+        with pytest.raises(ValueError, match="mutually"):
+            ClipPPOLoss(
+                self._create_mock_actor(),
+                self._create_mock_value(),
+                normalize_advantage=True,
+                advantage_norm=PercentileValueNorm(shape=1),
+            )
+
+    def test_ppo_advantage_norm_precomputed_advantage_skips_update(self):
+        """Repeated forwards over a precomputed rollout must not skew the
+        moving average: the statistics only update when the loss computes the
+        value target itself (or when the user calls update() explicitly)."""
+        torch.manual_seed(self.seed)
+        td = self._create_mock_data_ppo()
+        td.set("advantage", torch.randn(td.batch_size[0], 1))
+        td.set("value_target", 100 * torch.rand(td.batch_size[0], 1))
+        norm = PercentileValueNorm(shape=1, rate=1.0)
+        loss_fn = ClipPPOLoss(
+            self._create_mock_actor(), self._create_mock_value(), advantage_norm=norm
+        )
+        loss_fn(td.clone())
+        loss_fn(td.clone())
+        torch.testing.assert_close(norm.low, torch.zeros(1))
+        torch.testing.assert_close(norm.high, torch.zeros(1))
+
+    def test_ppo_advantage_norm_nested_value_target_key(self):
+        torch.manual_seed(self.seed)
+        td = self._create_mock_data_ppo()
+        td.set(("nested", "value_target"), 100 * torch.rand(td.batch_size[0], 1))
+        norm = PercentileValueNorm(shape=1, rate=1.0)
+        loss_fn = ClipPPOLoss(
+            self._create_mock_actor(), self._create_mock_value(), advantage_norm=norm
+        )
+        loss_fn.set_keys(value_target=("nested", "value_target"))
+        advantage = torch.randn(td.batch_size[0], 1)
+        scaled = loss_fn._scale_advantage(advantage, td, update=True)
+        assert (norm.high != 0).any()
+        torch.testing.assert_close(scaled, advantage / norm.scale())
+
+    def test_ppo_advantage_norm_excludes_masked_rows(self):
+        """Rows marked invalid by ("collector", "mask") (e.g. SliceSampler
+        padding filled with sentinel values) must not pollute the statistics."""
+        torch.manual_seed(self.seed)
+        batch = 16
+        value_target = torch.rand(batch, 1)
+        value_target[-2:] = 1e9
+        mask = torch.ones(batch, 1, dtype=torch.bool)
+        mask[-2:] = False
+        td = TensorDict(
+            {"value_target": value_target, ("collector", "mask"): mask}, [batch]
+        )
+        norm = PercentileValueNorm(shape=1, rate=1.0)
+        loss_fn = ClipPPOLoss(
+            self._create_mock_actor(), self._create_mock_value(), advantage_norm=norm
+        )
+        loss_fn._scale_advantage(torch.randn(batch, 1), td, update=True)
+        expected_low, expected_high = torch.quantile(
+            value_target[:-2].reshape(-1), torch.tensor([0.05, 0.95])
+        )
+        torch.testing.assert_close(norm.low, expected_low.reshape(1))
+        torch.testing.assert_close(norm.high, expected_high.reshape(1))
+
 
 def test_ppo_ess_preserves_feature_shape_for_singleton_batch():
     class TokenActor(nn.Module):
@@ -1738,6 +2121,108 @@ def test_ppo_ess_preserves_feature_shape_for_singleton_batch():
         ess.append(output["ESS"])
 
     assert torch.stack(ess).shape == (2, chunk_size, action_dim)
+
+
+class TestObjectiveEntropy:
+    """Closed-form vs Monte Carlo entropy without try/except (issue #2403)."""
+
+    def _ppo_loss(self):
+        return TestPPO()._make_entropy_loss(entropy_coeff=0.01)
+
+    def _a2c_loss(self):
+        helper = TestA2C()
+        return A2CLoss(helper._create_mock_actor(), helper._create_mock_value())
+
+    def test_ppo_entropy_mc_without_analytic(self):
+        loss = self._ppo_loss()
+        loc = torch.zeros(3, 4)
+        scale = torch.ones(3, 4)
+        dist = _NormalWithoutEntropy(loc, scale)
+        entropy = loss._get_entropy(dist, adv_shape=loc.shape)
+        assert torch.isfinite(entropy).all()
+        assert entropy.shape == loc.shape + (1,)
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_ppo_entropy_mc_when_analytic_is_nonfinite(self, compiled):
+        if compiled and sys.version_info >= (3, 14):
+            pytest.skip("torch.compile requires Python < 3.14")
+        loss = self._ppo_loss()
+
+        def get_entropy(loc, scale):
+            dist = _NormalWithNonfiniteEntropy(loc, scale)
+            return loss._get_entropy(dist, adv_shape=loc.shape)
+
+        if compiled:
+            get_entropy = torch.compile(get_entropy, backend="eager", fullgraph=True)
+        entropy = get_entropy(torch.zeros(3, 4), torch.ones(3, 4))
+        assert torch.isfinite(entropy).all()
+        assert entropy.shape == (3, 4, 1)
+
+    @pytest.mark.parametrize("kind", ["normal", "independent", "categorical"])
+    def test_ppo_entropy_matches_analytic(self, kind):
+        loss = self._ppo_loss()
+        dist, expected = _analytic_entropy_case(kind)
+        entropy = loss._get_entropy(dist, adv_shape=expected.shape)
+        torch.testing.assert_close(entropy, expected.unsqueeze(-1))
+
+    @pytest.mark.parametrize(
+        "distribution_class", [d.Normal, _NormalWithNonfiniteEntropy]
+    )
+    def test_ppo_entropy_composite_matches_analytic(self, distribution_class):
+        loss = self._ppo_loss()
+        loc = torch.zeros(3, 2)
+        scale = torch.ones(3, 2)
+        params = TensorDict(
+            {"action": TensorDict({"loc": loc, "scale": scale}, [3])},
+            [3],
+        )
+        dist = CompositeDistribution(
+            params,
+            distribution_map={"action": distribution_class},
+            name_map={"action": "action"},
+        )
+        expected = d.Normal(loc, scale).entropy().sum(-1).unsqueeze(-1)
+        with set_composite_lp_aggregate(True):
+            entropy = loss._get_entropy(dist, adv_shape=torch.Size([3]))
+        if distribution_class is d.Normal:
+            torch.testing.assert_close(entropy, expected)
+        else:
+            assert torch.isfinite(entropy).all()
+
+    def test_a2c_entropy_mc_without_analytic(self):
+        loss = self._a2c_loss()
+        loc = torch.zeros(3, 4)
+        scale = torch.ones(3, 4)
+        dist = _NormalWithoutEntropy(loc, scale)
+        entropy = loss.get_entropy_bonus(dist)
+        assert torch.isfinite(entropy).all()
+        assert entropy.shape == loc.shape + (1,)
+
+    @pytest.mark.parametrize("kind", ["normal", "independent", "categorical"])
+    def test_a2c_entropy_matches_analytic(self, kind):
+        loss = self._a2c_loss()
+        dist, expected = _analytic_entropy_case(kind)
+        entropy = loss.get_entropy_bonus(dist)
+        torch.testing.assert_close(entropy, expected.unsqueeze(-1))
+
+    def test_a2c_entropy_composite_is_finite(self):
+        # CompositeDistribution.entropy() is not a closed-form tensor; A2C
+        # must take the MC path and still return a finite entropy tensor.
+        loss = self._a2c_loss()
+        loc = torch.zeros(3, 2)
+        scale = torch.ones(3, 2)
+        params = TensorDict(
+            {"action": TensorDict({"loc": loc, "scale": scale}, [3])},
+            [3],
+        )
+        dist = CompositeDistribution(
+            params,
+            distribution_map={"action": TanhNormal},
+            name_map={"action": "action"},
+        )
+        entropy = loss.get_entropy_bonus(dist)
+        assert torch.isfinite(entropy).all()
+        assert not isinstance(entropy, TensorDict)
 
 
 class TestA2C(LossModuleTestBase):
@@ -2165,13 +2650,12 @@ class TestA2C(LossModuleTestBase):
     @pytest.mark.skipif(
         not _has_functorch, reason=f"functorch not found, {FUNCTORCH_ERR}"
     )
+    @pytest.mark.skip(reason="make_functional_with_buffers needs to be changed")
     @pytest.mark.parametrize("gradient_mode", (True, False))
     @pytest.mark.parametrize("advantage", ("gae", "vtrace", "td", "td_lambda", None))
     @pytest.mark.parametrize("device", get_default_devices())
     @pytest.mark.parametrize("composite_action_dist", [True, False])
     def test_a2c_diff(self, device, gradient_mode, advantage, composite_action_dist):
-        if pack_version.parse(torch.__version__) > pack_version.parse("1.14"):
-            raise pytest.skip("make_functional_with_buffers needs to be changed")
         torch.manual_seed(self.seed)
         td = self._create_seq_mock_data_a2c(
             device=device, composite_action_dist=composite_action_dist
@@ -2574,6 +3058,53 @@ class TestA2C(LossModuleTestBase):
             # Test it works with value key
             loss = loss_fn(td)
             assert "loss_critic" in loss.keys()
+
+    def test_a2c_advantage_norm(self):
+        """advantage_norm must update once on the freshly computed value target
+        and divide the advantage by the resulting scale."""
+        torch.manual_seed(self.seed)
+        td = self._create_seq_mock_data_a2c()
+        actor = self._create_mock_actor()
+        value = self._create_mock_value()
+
+        norm = PercentileValueNorm(shape=1, rate=1.0, min_scale=1e-6)
+        loss_fn = A2CLoss(actor, value, advantage_norm=norm)
+
+        # Independent probe of the value target the estimator will produce.
+        probe = A2CLoss(actor, value)
+        td_probe = td.clone()
+        probe.value_estimator(
+            td_probe,
+            params=probe._cached_detach_critic_network_params,
+            target_params=probe.target_critic_network_params,
+        )
+        expected_low, expected_high = torch.quantile(
+            td_probe.get("value_target").reshape(-1), torch.tensor([0.05, 0.95])
+        )
+        loss_fn(td.clone())
+        torch.testing.assert_close(norm.low, expected_low.reshape(1))
+        torch.testing.assert_close(norm.high, expected_high.reshape(1))
+
+        # A precomputed advantage is scaled by the frozen statistics without
+        # updating them.
+        advantage = torch.randn(*td.batch_size, 1)
+        value_target = 100 * torch.rand(*td.batch_size, 1)
+        td_pre = td.clone()
+        td_pre.set("advantage", advantage)
+        td_pre.set("value_target", value_target)
+        loss_scaled = A2CLoss(actor, value, advantage_norm=norm)(td_pre)
+        torch.testing.assert_close(norm.low, expected_low.reshape(1))
+        torch.testing.assert_close(norm.high, expected_high.reshape(1))
+
+        scale = (expected_high - expected_low).clamp_min(1e-6)
+        loss_ref_fn = A2CLoss(actor, value)
+        td_ref = td.clone()
+        td_ref.set("advantage", advantage / scale)
+        td_ref.set("value_target", value_target)
+        loss_ref = loss_ref_fn(td_ref)
+        torch.testing.assert_close(
+            loss_scaled["loss_objective"], loss_ref["loss_objective"]
+        )
 
 
 class TestReinforce(LossModuleTestBase):
@@ -3061,6 +3592,61 @@ class TestReinforce(LossModuleTestBase):
             # Test it works with value key
             loss = loss_fn(td)
             assert "loss_value" in loss.keys()
+
+
+class TestKLAdaptiveLR:
+    def test_rescales_outside_the_kl_band_only(self):
+        optimizer = torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=1e-3)
+        scheduler = KLAdaptiveLR(optimizer, target_kl=0.01, factor=2.0)
+        scheduler.step(0.05)
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(5e-4)
+        scheduler.step(0.01)
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(5e-4)
+        scheduler.step(torch.tensor(0.001))
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-3)
+        scheduler.step(0.0)
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-3)
+        assert scheduler.last_kl == 0.0
+        assert scheduler.get_last_lr() == [pytest.approx(1e-3)]
+
+    def test_clamps_every_parameter_group(self):
+        optimizer = torch.optim.SGD(
+            [
+                {"params": [nn.Parameter(torch.zeros(1))], "lr": 1e-3},
+                {"params": [nn.Parameter(torch.zeros(1))], "lr": 5e-3},
+            ]
+        )
+        scheduler = KLAdaptiveLR(
+            optimizer, target_kl=0.01, factor=10.0, min_lr=2e-4, max_lr=8e-3
+        )
+        scheduler.step(1.0)
+        assert scheduler.get_last_lr() == [pytest.approx(2e-4), pytest.approx(5e-4)]
+        scheduler.step(1e-6)
+        scheduler.step(1e-6)
+        assert scheduler.get_last_lr() == [pytest.approx(8e-3), pytest.approx(8e-3)]
+
+    def test_rejects_invalid_configuration_and_kl(self):
+        optimizer = torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=1e-3)
+        with pytest.raises(ValueError, match="target_kl"):
+            KLAdaptiveLR(optimizer, target_kl=0.0)
+        with pytest.raises(ValueError, match="factor"):
+            KLAdaptiveLR(optimizer, target_kl=0.01, factor=1.0)
+        with pytest.raises(ValueError, match="min_lr"):
+            KLAdaptiveLR(optimizer, target_kl=0.01, min_lr=1e-2, max_lr=1e-3)
+        scheduler = KLAdaptiveLR(optimizer, target_kl=0.01)
+        with pytest.raises(ValueError, match="finite"):
+            scheduler.step(float("nan"))
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-3)
+
+    def test_state_dict_roundtrip(self):
+        optimizer = torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=1e-3)
+        scheduler = KLAdaptiveLR(optimizer, target_kl=0.02, factor=3.0)
+        scheduler.step(0.1)
+        restored = KLAdaptiveLR(optimizer, target_kl=0.01)
+        restored.load_state_dict(scheduler.state_dict())
+        assert restored.target_kl == 0.02
+        assert restored.factor == 3.0
+        assert restored.last_kl == 0.1
 
 
 if __name__ == "__main__":

@@ -8,7 +8,11 @@ satellite) across the three physics backends."""
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import math
 import os
+import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -20,15 +24,20 @@ from torchrl.envs import (
     AntEnv,
     Compose,
     CubeBowlEnv,
+    ExplorationType,
     HopperEnv,
     HumanoidEnv,
+    InitTracker,
     MacroPrimitive,
     MacroPrimitiveTransform,
+    MicroDuckEnv,
+    MicroDuckTaskSampler,
     MujocoEnv,
     ParallelEnv,
     RobotMacroAction,
     SatelliteEnv,
     SerialEnv,
+    set_exploration_type,
     TransformedEnv,
     URScriptPrimitiveTransform,
     Walker2dEnv,
@@ -48,7 +57,12 @@ from torchrl.envs.custom.mujoco._math import (
     quat_mul,
     random_unit_quat,
 )
+from torchrl.envs.custom.mujoco.microduck import (
+    _body_frame_linear_velocity,
+    _low_cost_collision_scene,
+)
 from torchrl.envs.utils import check_env_specs, step_mdp
+from torchrl.render import load_checkpoint
 
 if _has_mujoco:
     import mujoco
@@ -128,6 +142,1230 @@ class TestMujoco:
         env.step(td)
         assert torch.equal(state["qpos"], qpos)
         env.close()
+
+    @staticmethod
+    def _write_microduck_fixture(tmp_path: Path) -> Path:
+        """A 14-actuator stand-in for the MicroDuck MJCF that rests on two feet."""
+        lines = [
+            '<mujoco model="microduck-test">',
+            '  <option timestep="0.002"/>',
+            (
+                '  <default><joint damping="0.1" limited="true" range="-1 1"/>'
+                '<geom density="1000" contype="0" conaffinity="0"/></default>'
+            ),
+            '  <worldbody><geom type="plane" size="1 1 0.1" contype="1" conaffinity="1"/>',
+            '    <body name="torso" pos="0 0 0.12"><freejoint name="root"/>',
+            '      <geom type="sphere" size="0.02" mass="0.1"/>',
+            '      <site name="head_imu" pos="0 0 0.02" quat="0.707107 0 -0.707107 0"/>',
+            '      <site name="mouth_tip" pos="0.0266783 0 -0.00332564"/>',
+        ]
+        for side, y in (("left", 0.03), ("right", -0.03)):
+            lines.extend(
+                (
+                    f'      <body name="{side}_foot_body" pos="0 {y} -0.11">',
+                    f'        <geom name="{side}_foot_collision" type="box" '
+                    'size="0.02 0.01 0.005" contype="1" conaffinity="1" mass="0.02"/>',
+                    f'        <site name="{side}_foot" pos="0 0 -0.005"/>',
+                    "      </body>",
+                )
+            )
+        for index in range(14):
+            axis = ("1", "0", "0") if index % 2 == 0 else ("0", "1", "0")
+            indent = "      " + "  " * index
+            lines.extend(
+                (
+                    f'{indent}<body name="link{index}">',
+                    f'{indent}  <joint name="joint{index}" axis="{" ".join(axis)}"/>',
+                    f'{indent}  <geom type="sphere" size="0.005" mass="0.01"/>',
+                )
+            )
+        for index in reversed(range(14)):
+            lines.append("      " + "  " * index + "</body>")
+        stand_qpos = "0 0 0.12 1 0 0 0 " + " ".join(["0"] * 14)
+        stand_ctrl = " ".join(["0"] * 14)
+        lines.extend(
+            (
+                "    </body>",
+                "  </worldbody>",
+                "  <actuator>",
+                *(
+                    f'    <position name="actuator{index}" joint="joint{index}" '
+                    'kp="5" ctrlrange="-1 1"/>'
+                    for index in range(14)
+                ),
+                "  </actuator>",
+                "  <keyframe>",
+                f'    <key name="STAND" qpos="{stand_qpos}" ctrl="{stand_ctrl}"/>',
+                "  </keyframe>",
+                "</mujoco>",
+            )
+        )
+        scene = tmp_path / "scene_walk.xml"
+        scene.write_text("\n".join(lines))
+        return scene
+
+    @pytest.mark.parametrize("backend", _AVAILABLE_BACKENDS)
+    def test_microduck_specs_reward_and_termination(self, tmp_path, backend):
+        num_envs = 1 if backend == "mujoco" else 2
+        env = MicroDuckEnv(
+            self._write_microduck_fixture(tmp_path),
+            backend=backend,
+            tasks=[
+                MicroDuckEnv.tracking_task(-0.3),
+                MicroDuckEnv.standing_task(),
+                MicroDuckEnv.tracking_task(0.3),
+            ],
+            num_envs=num_envs,
+            reset_noise_scale=0.0,
+            seed=0,
+        )
+        check_env_specs(env)
+        assert env.tasks.shape == (3,)
+        reset = env.reset()
+        assert reset["observation"].shape == (num_envs, MicroDuckEnv.OBSERVATION_DIM)
+        torch.testing.assert_close(
+            reset["observation"][..., :3],
+            torch.tensor([[0.0, 0.0, -1.0]]).expand(num_envs, -1),
+        )
+        # The fixture starts 5 mm above the floor with both feet airborne.
+        assert not env.foot_contacts().any()
+        torch.testing.assert_close(
+            env.foot_heights(), torch.full((num_envs, 2), 0.005), atol=1e-4, rtol=0
+        )
+        action = torch.zeros_like(env.action_spec.rand())
+        for task_id, speed in enumerate((-0.3, 0.0, 0.3)):
+            reset = env.reset(
+                TensorDict(
+                    {"task_id": torch.full((num_envs, 1), task_id)},
+                    batch_size=(num_envs,),
+                )
+            )
+            command = torch.tensor([[speed, 0.0]]).expand(num_envs, -1)
+            assert (reset["task_id"] == task_id).all()
+            torch.testing.assert_close(reset["command"], command)
+            torch.testing.assert_close(reset["observation"][..., 9:11], command)
+
+            state = env.get_state()
+            matching = state.clone()
+            matching["qvel"][..., 0] = speed
+            mismatched = state.clone()
+            mismatched["qvel"][..., 0] = -speed if speed else 0.3
+            matching_reward = env._compute_reward(state, action, matching)
+            mismatched_reward = env._compute_reward(state, action, mismatched)
+            assert (matching_reward > mismatched_reward).all()
+            pose_offset = matching.clone()
+            pose_offset["qpos"][..., 7:] += 0.35
+            pose_cost = matching_reward - env._compute_reward(
+                state, action, pose_offset
+            )
+            components = env._reward_components(matching, action)
+            gait_terms = torch.stack(
+                [
+                    components[f"diagnostic_reward_{name}"]
+                    for name in MicroDuckEnv.GAIT_TERMS
+                ]
+            )
+            if speed:
+                # The walking rows hold the pose loosely and pay the gait
+                # terms, but with both feet off the ground there is no correct
+                # single support to credit.
+                assert (pose_cost < 0.01).all()
+                assert (components["diagnostic_reward_phase_contact"] == 0).all()
+                torch.testing.assert_close(
+                    components["diagnostic_reward_swing_height"],
+                    torch.full((num_envs, 1), 2.0 * 0.25 * 0.02),
+                    atol=2e-4,
+                    rtol=0,
+                )
+                stationary_reward = env._compute_reward(state, action, state)
+                assert (matching_reward > stationary_reward).all()
+            else:
+                # The standing row holds the pose tightly and has no gait terms.
+                assert (pose_cost > 0.015).all()
+                assert (gait_terms == 0).all()
+            assert not env._compute_done(state, mismatched).any()
+
+        # Once the robot rests on both feet, keeping them planted under a
+        # walking task is penalized and earns no phase credit; only correct
+        # single support does.
+        for _ in range(10):
+            env.step(reset.set("action", action))
+        assert env.foot_contacts().all()
+        assert (env.foot_heights().abs() < 5e-3).all()
+        planted = env._reward_components(env.get_state(), action)
+        # Standing still under a walking command keeps the floor (one half)
+        # of the gait credit, penalty included.
+        torch.testing.assert_close(
+            planted["diagnostic_reward_double_support"],
+            torch.full((num_envs, 1), -1.0 * 0.02 * 0.5),
+            atol=1e-4,
+            rtol=0,
+        )
+        assert (planted["diagnostic_reward_phase_contact"] == 0).all()
+        state = env.get_state()
+
+        # Linear velocity is rotated into the body frame before rewarding it.
+        yawed = state.clone()
+        yawed["qpos"][..., 3:7] = torch.tensor([2**-0.5, 0.0, 0.0, 2**-0.5])
+        body_forward = yawed.clone()
+        body_forward["qvel"][..., 1] = 0.3
+        fixed_world_x = yawed.clone()
+        fixed_world_x["qvel"][..., 0] = 0.3
+        assert (
+            env._compute_reward(state, action, body_forward)
+            > env._compute_reward(state, action, fixed_world_x)
+        ).all()
+
+        fallen = state.clone()
+        fallen["qpos"][..., 2] = 0.01
+        fallen["qpos"][..., 3:7] = torch.tensor([0.0, 1.0, 0.0, 0.0])
+        assert env._compute_done(state, fallen).all()
+        torch.testing.assert_close(
+            env._reward_components(fallen, action)["diagnostic_reward_termination"],
+            torch.full((num_envs, 1), -MicroDuckEnv.FALL_PENALTY),
+        )
+
+        action.fill_(0.25)
+        transition = env.step(reset.set("action", action))
+        start = MicroDuckEnv.GAIT_PHASE_START + 3
+        torch.testing.assert_close(
+            transition["next", "observation"][..., start : start + 14], action
+        )
+        env.close()
+
+    @pytest.mark.parametrize("backend", _AVAILABLE_BACKENDS)
+    def test_microduck_reset_task_and_command_survive_transformed_env(
+        self, tmp_path, backend
+    ):
+        num_envs = 1 if backend == "mujoco" else 2
+        env = TransformedEnv(
+            MicroDuckEnv(
+                self._write_microduck_fixture(tmp_path),
+                backend=backend,
+                num_envs=num_envs,
+                tasks=[
+                    MicroDuckEnv.standing_task(),
+                    MicroDuckEnv.speed_range_task(0.0, 0.1),
+                ],
+                reset_noise_scale=0.0,
+                seed=0,
+            ),
+            InitTracker(),
+        )
+        check_env_specs(env)
+        task_id = torch.ones(num_envs, 1, dtype=torch.long)
+        command = torch.tensor([[0.06, 0.0]] * num_envs)
+        reset = env.reset(
+            TensorDict({"task_id": task_id, "command": command}, batch_size=(num_envs,))
+        )
+        assert (reset["task_id"] == 1).all()
+        torch.testing.assert_close(reset["command"], command)
+        torch.testing.assert_close(reset["observation"][..., 9:11], command)
+        rollout = env.rollout(3, tensordict=reset, auto_reset=False)
+        assert (rollout["next", "task_id"] == 1).all()
+        torch.testing.assert_close(
+            rollout["next", "command"], command.unsqueeze(1).expand(num_envs, 3, 2)
+        )
+        env.close()
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_task_library_picks_rows_at_reset(self, tmp_path):
+        scene = self._write_microduck_fixture(tmp_path)
+        tasks = [
+            MicroDuckEnv.standing_task(weight=0.0),
+            MicroDuckEnv.tracking_task(0.2),
+            MicroDuckEnv.sidestep_task(-0.15),
+        ]
+        stacked = torch.stack(tasks)
+        assert stacked.shape == (3,)
+        assert list(stacked.name) == ["standing", "tracking+0.20", "sidestep-0.15"]
+        torch.testing.assert_close(
+            stacked.command_high, torch.tensor([[0.0, 0.0], [0.2, 0.0], [0.0, -0.15]])
+        )
+        # A single task is a library of one; a sequence and a stacked task
+        # are the same library.
+        assert MicroDuckEnv.stack_tasks(tasks[1]).shape == (1,)
+        assert (MicroDuckEnv.stack_tasks(tasks) == stacked).all()
+        env = MicroDuckEnv(
+            scene, backend="mujoco", num_envs=2, parallel=False, tasks=stacked, seed=0
+        )
+        assert isinstance(env, SerialEnv)
+        check_env_specs(env)
+        # The env's own draw follows the task weights: the zero-weight task is
+        # never picked and the others are.
+        ids = torch.cat([env.reset()["task_id"].flatten() for _ in range(20)])
+        assert (ids > 0).all() and ids.unique().numel() == 2
+        # Provided ids pick the rows and the command follows them.
+        reset = env.reset(
+            TensorDict({"task_id": torch.tensor([[[1]], [[2]]])}, batch_size=(2, 1))
+        )
+        torch.testing.assert_close(
+            reset["command"].flatten(0, 1), torch.tensor([[0.2, 0.0], [0.0, -0.15]])
+        )
+        env.step(reset.set("action", env.action_spec.zero()))
+        # A partial reset replaces only the rows of the envs being reset; the
+        # other env keeps its task through the next step.
+        partial = env.reset(
+            TensorDict(
+                {
+                    "_reset": torch.tensor([[True], [False]]),
+                    "task_id": torch.tensor([[[0]], [[1]]]),
+                },
+                batch_size=(2, 1),
+            )
+        )
+        after = env.step(partial.set("action", env.action_spec.zero()))
+        assert after["next", "task_id"].flatten().tolist() == [0, 2]
+        assert [list(task.name)[0] for task in env._task] == [
+            "standing",
+            "sidestep-0.15",
+        ]
+        assert all(
+            list(library.name) == ["standing", "tracking+0.20", "sidestep-0.15"]
+            for library in env.tasks
+        )
+        torch.testing.assert_close(
+            after["next", "command"].flatten(0, 1),
+            torch.tensor([[0.0, 0.0], [0.0, -0.15]]),
+        )
+        with pytest.raises(ValueError, match="index the 3 tasks"):
+            env.reset(
+                TensorDict({"task_id": torch.tensor([[[3]], [[0]]])}, batch_size=(2, 1))
+            )
+        env.close()
+        # Stacking is the structural validation: a weight vector that does not
+        # cover the registered terms is rejected, and so are unknown names.
+        stale = tasks[0].clone()
+        stale.reward_weights = torch.zeros(3)
+        with pytest.raises(RuntimeError, match="reward_weights"):
+            MicroDuckEnv.stack_tasks([stale, tasks[1]])
+        with pytest.raises(ValueError, match="one entry per registered term"):
+            MicroDuckEnv.stack_tasks(stale)
+        with pytest.raises(ValueError, match="Unknown task field"):
+            MicroDuckEnv.tracking_task(0.2, gait_ramp=1.0)
+        with pytest.raises(ValueError, match="string name"):
+            MicroDuckEnv.tracking_task(0.2, name="")
+        assert MicroDuckEnv.tracking_task(0.2, name="fwd").name == "fwd"
+        # Non-finite or out-of-range rows are rejected when built and when stacked.
+        with pytest.raises(ValueError, match="finite"):
+            MicroDuckEnv.tracking_task(0.2, reward_weights={"tracking": float("nan")})
+        with pytest.raises(ValueError, match="finite"):
+            MicroDuckEnv.tracking_task(float("inf"))
+        with pytest.raises(ValueError, match="gait_frequency_hz"):
+            MicroDuckEnv.tracking_task(0.2, gait_frequency_hz=0.0)
+        poisoned = tasks[1].clone()
+        poisoned.reward_weights[0] = float("nan")
+        with pytest.raises(ValueError, match="finite"):
+            MicroDuckEnv.stack_tasks([tasks[0], poisoned])
+        with pytest.raises(ValueError, match="unregistered"):
+            MicroDuckEnv.jump_task(reward_weights={"fly": 1.0})
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_speed_range_and_warm_start_follow_the_row(self, tmp_path):
+        scene = self._write_microduck_fixture(tmp_path)
+        warm = {"warm_start_velocity": (0.2, 0.2), "warm_start_fraction": 1.0}
+        env = MicroDuckEnv(
+            scene,
+            backend="mujoco",
+            tasks=[
+                MicroDuckEnv.speed_range_task(0.1, 0.3, **warm),
+                MicroDuckEnv.sidestep_task(0.15, **warm),
+                MicroDuckEnv.jump_task(joint_reset_noise_scale=0.3, **warm),
+            ],
+            reset_noise_scale=0.0,
+            seed=0,
+        )
+        assert env.tasks.gait_frequency_per_mps.tolist() == [5.0, 0.0, 0.0]
+        # A fresh reset TensorDict each time: reset writes its outputs, the
+        # command included, into the one it is given.
+        commands = torch.stack(
+            [
+                env.reset(
+                    TensorDict({"task_id": torch.tensor([[0]])}, batch_size=(1,))
+                )["command"]
+                for _ in range(20)
+            ]
+        )
+        assert (commands[..., 0] >= 0.1).all() and (commands[..., 0] <= 0.3).all()
+        assert commands[..., 0].std() > 0.01
+        assert (commands[..., 1] == 0).all()
+        # The warm start follows the commanded direction, including a command
+        # pinned at reset: backward for the speed range row, sideways for the
+        # sidestep row, and not at all under the jump row's zero command.
+        env.reset(
+            TensorDict(
+                {
+                    "task_id": torch.tensor([[0]]),
+                    "command": torch.tensor([[-0.2, 0.0]]),
+                },
+                batch_size=(1,),
+            )
+        )
+        torch.testing.assert_close(
+            env.get_state()["qvel"][0, :3], torch.tensor([-0.2, 0.0, 0.0])
+        )
+        env.reset(TensorDict({"task_id": torch.tensor([[1]])}, batch_size=(1,)))
+        torch.testing.assert_close(
+            env.get_state()["qvel"][0, :3], torch.tensor([0.0, 0.2, 0.0])
+        )
+        assert (env.get_state()["qpos"][0, 7:].abs() <= 0.02).all()
+        env.reset(TensorDict({"task_id": torch.tensor([[2]])}, batch_size=(1,)))
+        state = env.get_state()
+        assert (state["qvel"][0, :3] == 0).all()
+        # The joint reset noise is the row's: 0.3 rad for the jump row only.
+        assert (state["qpos"][0, :2] == 0).all()
+        assert (state["qpos"][0, 7:].abs() > 0.05).any()
+        assert (state["qpos"][0, 7:].abs() <= 0.3).all()
+        env.close()
+        with pytest.raises(ValueError, match="warm_start_velocity"):
+            MicroDuckEnv.tracking_task(0.2, warm_start_velocity=(0.3, 0.1))
+        with pytest.raises(ValueError, match="warm_start_fraction"):
+            MicroDuckEnv.tracking_task(0.2, warm_start_fraction=1.5)
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_clock_and_reward_weights_follow_the_row(self, tmp_path):
+        scene = self._write_microduck_fixture(tmp_path)
+        env = MicroDuckEnv(
+            scene,
+            backend="mujoco",
+            tasks=[
+                MicroDuckEnv.speed_range_task(0.1, 0.1),
+                MicroDuckEnv.speed_range_task(
+                    0.3, 0.3, reward_weights={"tracking": 4.0, "phase_contact": 0.0}
+                ),
+            ],
+            reset_noise_scale=0.0,
+            seed=0,
+        )
+        check_env_specs(env)
+        action = torch.zeros_like(env.action_spec.rand())
+        phases = {}
+        for task_id in (0, 1):
+            td = env.reset(
+                TensorDict({"task_id": torch.tensor([[task_id]])}, batch_size=(1,))
+            )
+            for _ in range(5):
+                td = env.step(td.set("action", action))["next"]
+            phases[task_id] = env._gait_clock()[0].item()
+            state = env.get_state()
+            body_velocity = _body_frame_linear_velocity(
+                state["qpos"][0, 3:7].to(env.dtype), state["qvel"][0, :3].to(env.dtype)
+            )
+            torch.testing.assert_close(td["observation"][0, 6:9], body_velocity)
+        # Five steps of 0.02 s: frequency 1.5 Hz at 0.1 m/s vs 2.5 Hz at 0.3 m/s.
+        expected = 2 * math.pi * (2.5 - 1.5) * 5 * 0.02
+        assert phases[1] - phases[0] == pytest.approx(expected, abs=1e-4)
+        # The second row doubles the tracking weight and drops the phase term;
+        # a matched velocity earns 4 * dt from tracking there and 2 * dt on the
+        # first row.
+        matched = env.get_state().clone()
+        matched["qvel"][..., 0] = 0.3
+        components = env._reward_components(matched, action)
+        assert (components["diagnostic_reward_phase_contact"] == 0).all()
+        torch.testing.assert_close(
+            components["diagnostic_reward_tracking"], torch.full((1, 1), 4.0 * 0.02)
+        )
+        env.reset(
+            TensorDict(
+                {"task_id": torch.tensor([[0]]), "command": torch.tensor([[0.3, 0.0]])},
+                batch_size=(1,),
+            )
+        )
+        torch.testing.assert_close(
+            env._reward_components(matched, action)["diagnostic_reward_tracking"],
+            torch.full((1, 1), 2.0 * 0.02),
+        )
+        env.close()
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_scene_resolution_and_download(self, tmp_path, monkeypatch):
+        from torchrl.envs.custom.mujoco import microduck as microduck_module
+
+        (tmp_path / "fixture").mkdir()
+        fixture = self._write_microduck_fixture(tmp_path / "fixture")
+        checkout = tmp_path / "microduck_rl" / "src" / "mjlab_microduck" / "robot"
+        checkout = checkout / "microduck"
+        checkout.mkdir(parents=True)
+        scene = shutil.copy(fixture, checkout / "scene_walk.xml")
+        cache = tmp_path / "cache"
+        calls = []
+
+        def fake_download(root, commit, *, force):
+            calls.append(force)
+            target = root / f"microduck_rl-{commit}"
+            if force and target.exists():
+                shutil.rmtree(target)
+            if not target.exists():
+                scene_dir = target / "src" / "mjlab_microduck" / "robot" / "microduck"
+                scene_dir.mkdir(parents=True)
+                shutil.copy(fixture, scene_dir / "scene_walk.xml")
+            return target
+
+        monkeypatch.setattr(microduck_module, "_download_microduck_rl", fake_download)
+        monkeypatch.delenv(MicroDuckEnv.ROOT_ENV_VAR, raising=False)
+        monkeypatch.setattr(
+            "torchrl.envs.custom.mujoco.microduck.importlib.util.find_spec",
+            lambda name: None,
+        )
+        # Explicit paths: a checkout, its package directory or the scene itself.
+        assert MicroDuckEnv.resolve_scene(checkout) == scene.resolve()
+        assert MicroDuckEnv.resolve_scene(scene) == scene.resolve()
+        with pytest.raises(FileNotFoundError):
+            MicroDuckEnv.resolve_scene(tmp_path / "elsewhere")
+        with pytest.raises(ValueError, match="microduck_root"):
+            MicroDuckEnv(scene, xml_path=scene)
+        # Without any source the error lists every option and nothing downloads.
+        with pytest.raises(FileNotFoundError, match="download=True") as excinfo:
+            MicroDuckEnv(root=cache)
+        assert MicroDuckEnv.ROOT_ENV_VAR in str(excinfo.value)
+        assert calls == []
+        # A batched native env resolves once in the parent, not once per worker.
+        env = MicroDuckEnv(
+            root=cache,
+            download=True,
+            backend="mujoco",
+            num_envs=2,
+            parallel=False,
+            seed=0,
+        )
+        assert calls == [False]
+        assert isinstance(env, SerialEnv)
+        assert env.rollout(3)["command"].shape == (2, 1, 3, 2)
+        env.close()
+        # The cached checkout is found without downloading again ...
+        env = MicroDuckEnv(root=cache, backend="mujoco", seed=0)
+        assert calls == [False]
+        assert env.scene_path.is_relative_to(cache)
+        env.close()
+        # ... unless a re-download is forced, and the environment variable
+        # takes precedence over the cache.
+        MicroDuckEnv.resolve_scene(root=cache, download="force")
+        assert calls == [False, True]
+        monkeypatch.setenv(MicroDuckEnv.ROOT_ENV_VAR, str(tmp_path / "microduck_rl"))
+        assert MicroDuckEnv.resolve_scene(root=cache) == scene.resolve()
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_diagnostics_are_opt_in_and_sum_to_reward(self, tmp_path):
+        scene = self._write_microduck_fixture(tmp_path)
+        env = MicroDuckEnv(scene, backend="mujoco", seed=0)
+        assert not any(
+            str(key).startswith("diagnostic_") for key in env.observation_spec.keys()
+        )
+        env.close()
+        env = MicroDuckEnv(scene, backend="mujoco", seed=0, diagnostics=True)
+        check_env_specs(env)
+        rollout = env.rollout(4)
+        components = torch.stack(
+            [
+                rollout["next", f"diagnostic_reward_{name}"]
+                for name in MicroDuckEnv.REWARD_TERMS
+            ]
+        ).sum(0)
+        torch.testing.assert_close(components, rollout["next", "reward"])
+        assert rollout["next", "diagnostic_height"].shape == (1, 4, 1)
+        env.close()
+        # An all-zero weight row is "no built-in reward": a transform can build
+        # its own from the observation and the pose diagnostics.
+        env = MicroDuckEnv(
+            scene,
+            backend="mujoco",
+            seed=0,
+            diagnostics=True,
+            tasks=MicroDuckEnv.standing_task(
+                reward_weights=dict.fromkeys(MicroDuckEnv.REWARD_TERMS, 0.0)
+            ),
+        )
+        rollout = env.rollout(4)
+        assert (rollout["next", "reward"] == 0).all()
+        assert (rollout["next", "diagnostic_upright"] > 0).all()
+        env.close()
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_sidestep_and_jump_terms_fire_on_their_signal(self, tmp_path):
+        scene = self._write_microduck_fixture(tmp_path)
+        env = MicroDuckEnv(
+            scene,
+            backend="mujoco",
+            tasks=[
+                MicroDuckEnv.sidestep_task(0.15),
+                MicroDuckEnv.sidestep_task(-0.15),
+                MicroDuckEnv.jump_task(),
+                MicroDuckEnv.standing_task(),
+            ],
+            seed=0,
+        )
+        action = torch.zeros_like(env.action_spec.rand())
+        reset = env.reset(TensorDict({"task_id": torch.tensor([[0]])}, batch_size=(1,)))
+        torch.testing.assert_close(reset["command"], torch.tensor([[0.0, 0.15]]))
+        state = env.get_state()
+        left, right = state.clone(), state.clone()
+        left["qvel"][..., 1] = 0.15
+        right["qvel"][..., 1] = -0.15
+        # Lateral velocity is tracked like the longitudinal one, in the
+        # commanded direction, and a sidestep keeps the gait terms active.
+        assert (
+            env._compute_reward(state, action, left)
+            > env._compute_reward(state, action, right)
+        ).all()
+        env.reset(TensorDict({"task_id": torch.tensor([[1]])}, batch_size=(1,)))
+        assert (
+            env._compute_reward(state, action, right)
+            > env._compute_reward(state, action, left)
+        ).all()
+        components = env._reward_components(right, action)
+        assert (components["diagnostic_reward_swing_height"] > 0).all()
+        assert (components["diagnostic_reward_jump"] == 0).all()
+
+        # Tracking is anisotropic: under the -0.15 sidestep command, a 0.05 m/s
+        # forward drift at the right lateral speed earns less than a 0.05 m/s
+        # lateral shortfall with no drift; under a zero command the two errors
+        # are worth the same.
+        def tracking(state):
+            return env._reward_components(state, action)["diagnostic_reward_tracking"]
+
+        diagonal, short = state.clone(), state.clone()
+        diagonal["qvel"][..., 0], diagonal["qvel"][..., 1] = 0.05, -0.15
+        short["qvel"][..., 1] = -0.10
+        assert (tracking(diagonal) < tracking(short)).all()
+        assert (tracking(short) < tracking(right)).all()
+        env.reset(TensorDict({"task_id": torch.tensor([[3]])}, batch_size=(1,)))
+        forward, lateral = state.clone(), state.clone()
+        forward["qvel"][..., :2] = torch.tensor([0.05, 0.0])
+        lateral["qvel"][..., :2] = torch.tensor([0.0, 0.05])
+        torch.testing.assert_close(tracking(forward), tracking(lateral))
+
+        # Progress is linear along the command and signed; gait credit keeps
+        # its floor when stepping in place and doubles when moving where
+        # asked, and neither pays for motion perpendicular to a sidestep.
+        env.reset(TensorDict({"task_id": torch.tensor([[1]])}, batch_size=(1,)))
+
+        def term(state, name):
+            return env._reward_components(state, action)[f"diagnostic_reward_{name}"]
+
+        still, half, drift = state.clone(), state.clone(), state.clone()
+        still["qvel"][..., :2] = 0.0
+        half["qvel"][..., :2] = torch.tensor([0.0, -0.075])
+        drift["qvel"][..., :2] = torch.tensor([0.075, 0.0])
+        torch.testing.assert_close(term(still, "progress"), torch.zeros(1, 1))
+        torch.testing.assert_close(
+            term(half, "progress"), torch.full((1, 1), 2.0 * 0.5 * 0.02)
+        )
+        assert (term(left, "progress") < 0).all()
+        torch.testing.assert_close(term(drift, "progress"), torch.zeros(1, 1))
+        torch.testing.assert_close(
+            term(right, "swing_height"), 2 * term(still, "swing_height")
+        )
+        torch.testing.assert_close(
+            term(drift, "swing_height"), term(still, "swing_height")
+        )
+        assert (term(still, "swing_height") > 0).all()
+
+        # The fixture starts with both feet airborne: under the jump row,
+        # raising the base by the target height earns the full jump reward,
+        # the vertical-velocity cost is off and the gait terms are silent.
+        env.reset(TensorDict({"task_id": torch.tensor([[2]])}, batch_size=(1,)))
+        # The hop rhythm pays linearly for vertical velocity on the beat of
+        # the clock, nothing for standing still and negatively off the beat.
+        phase, _ = env._gait_clock()
+        beat = phase.cos().sign()
+        amplitude = MicroDuckEnv.REWARD_PARAMS["hop_velocity_amplitude"]
+        on_beat, still, off_beat = (env.get_state().clone() for _ in range(3))
+        on_beat["qvel"][..., 2] = 0.5 * amplitude * beat
+        still["qvel"][..., 2] = 0.0
+        off_beat["qvel"][..., 2] = -0.5 * amplitude * beat
+
+        def rhythm(state):
+            return env._reward_components(state, action)["diagnostic_reward_hop_rhythm"]
+
+        torch.testing.assert_close(
+            rhythm(on_beat),
+            torch.full((1, 1), MicroDuckEnv.HOP_RHYTHM_WEIGHT * 0.5 * 0.02),
+        )
+        torch.testing.assert_close(rhythm(still), torch.zeros(1, 1))
+        torch.testing.assert_close(rhythm(off_beat), -rhythm(on_beat))
+        risen = env.get_state().clone()
+        risen["qpos"][..., 2] += MicroDuckEnv.REWARD_PARAMS["jump_target_height"]
+        risen["qvel"][..., 2] = 1.0
+        components = env._reward_components(risen, action)
+        torch.testing.assert_close(
+            components["diagnostic_reward_jump"],
+            torch.full((1, 1), MicroDuckEnv.JUMP_WEIGHT * 0.02),
+        )
+        assert (components["diagnostic_reward_lin_vel_z"] == 0).all()
+        for name in MicroDuckEnv.GAIT_TERMS:
+            assert (components[f"diagnostic_reward_{name}"] == 0).all()
+        # The jump row pays a linear drift penalty for planar speed, which the
+        # standing row does not use.
+        drifting = env.get_state().clone()
+        drifting["qvel"][..., 0] = 0.15
+        components = env._reward_components(drifting, action)
+        torch.testing.assert_close(
+            components["diagnostic_reward_drift"],
+            torch.full((1, 1), MicroDuckEnv.DRIFT_WEIGHT * 0.5 * 0.02),
+        )
+        # Under the standing row the same motion earns no jump reward and pays
+        # the vertical-velocity cost.
+        env.reset(TensorDict({"task_id": torch.tensor([[3]])}, batch_size=(1,)))
+        components = env._reward_components(risen, action)
+        assert (components["diagnostic_reward_jump"] == 0).all()
+        assert (components["diagnostic_reward_lin_vel_z"] < 0).all()
+        assert (
+            env._reward_components(drifting, action)["diagnostic_reward_drift"] == 0
+        ).all()
+        env.close()
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_task_sampler_writes_task_ids_at_reset(self, tmp_path):
+        scene = self._write_microduck_fixture(tmp_path)
+        library = [
+            MicroDuckEnv.standing_task(),
+            MicroDuckEnv.tracking_task(0.2),
+            MicroDuckEnv.jump_task(),
+        ]
+        sampler = MicroDuckTaskSampler([0.0, 0.0, 1.0])
+        env = TransformedEnv(
+            MicroDuckEnv(
+                scene,
+                backend="mujoco",
+                num_envs=2,
+                parallel=False,
+                tasks=library,
+                seed=0,
+            ),
+            sampler,
+        )
+        env.set_seed(0)
+        check_env_specs(env)
+        rollout = env.rollout(3)
+        assert (rollout["task_id"] == 2).all()
+        assert (rollout["command"] == 0).all()
+        # Changing the weights changes the next draws, and a partial reset only
+        # redraws the env being reset.
+        sampler.probabilities.copy_(torch.tensor([1.0, 0.0, 0.0]))
+        partial = env.reset(
+            TensorDict({"_reset": torch.tensor([[True], [False]])}, batch_size=(2, 1))
+        )
+        after = env.step(partial.set("action", env.action_spec.rand()))
+        assert after["next", "task_id"].flatten().tolist() == [0, 2]
+        env.close()
+        first = MicroDuckTaskSampler([1.0, 2.0, 1.0], seed=3).sample(torch.Size([8]))
+        second = MicroDuckTaskSampler([1.0, 2.0, 1.0], seed=3).sample(torch.Size([8]))
+        assert first.shape == (8, 1) and torch.equal(first, second)
+        for weights in ([1.0, -1.0], [1.0, float("nan")], [1.0, float("inf")]):
+            with pytest.raises(ValueError, match="finite.*non-negative"):
+                MicroDuckTaskSampler(weights)
+        # Fixed ids give every env its own task at every reset, including
+        # partial ones, which is how several tasks are filmed side by side.
+        env = TransformedEnv(
+            MicroDuckEnv(
+                scene,
+                backend="mujoco",
+                num_envs=2,
+                parallel=False,
+                tasks=library,
+                seed=0,
+            ),
+            MicroDuckTaskSampler.fixed([2, 0]),
+        )
+        rollout = env.rollout(3)
+        assert rollout["task_id"][..., 0].flatten(0, 1).tolist() == [[2] * 3, [0] * 3]
+        partial = env.reset(
+            TensorDict({"_reset": torch.tensor([[True], [False]])}, batch_size=(2, 1))
+        )
+        after = env.step(partial.set("action", env.action_spec.rand()))
+        assert after["next", "task_id"].flatten().tolist() == [2, 0]
+        with pytest.raises(ValueError, match="fixed task ids"):
+            TransformedEnv(env.base_env, MicroDuckTaskSampler.fixed([1])).reset()
+        env.close()
+        with pytest.raises(ValueError, match="exactly one"):
+            MicroDuckTaskSampler([1.0], task_ids=[0])
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_microduck_task_sampler_seeded_cuda(self):
+        first = MicroDuckTaskSampler([1.0, 2.0, 1.0], seed=3).cuda()
+        second = MicroDuckTaskSampler([1.0, 2.0, 1.0], seed=3).cuda()
+        first_sample = first.sample(torch.Size([8]))
+        second_sample = second.sample(torch.Size([8]))
+        assert first_sample.device.type == "cuda"
+        assert torch.equal(first_sample, second_sample)
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    @pytest.mark.parametrize("backend", _AVAILABLE_BACKENDS)
+    def test_microduck_head_level_and_turn_terms(self, tmp_path, backend):
+        scene = self._write_microduck_fixture(tmp_path)
+        env = MicroDuckEnv(
+            scene,
+            backend=backend,
+            tasks=[
+                MicroDuckEnv.standing_task(),
+                MicroDuckEnv.turning_task(1.0),
+                MicroDuckEnv.turning_task(-1.0),
+            ],
+            seed=0,
+            diagnostics=True,
+        )
+        action = torch.zeros_like(env.action_spec.rand())
+        env.reset(TensorDict({"task_id": torch.tensor([[0]])}, batch_size=(1,)))
+        level = env.get_state()
+        # The calibrated frame faces +x, despite a downward IMU-to-beak line
+        # matching the real robot's 41-degree offset.
+        nose_down = level.clone()
+        nose_down["qpos"][..., 3:7] = torch.tensor(
+            [math.cos(math.pi / 8), 0.0, math.sin(math.pi / 8), 0.0]
+        )
+        head_level = "diagnostic_reward_head_level"
+        env.reset(
+            TensorDict(qpos=level["qpos"], qvel=level["qvel"], batch_size=[1]),
+            set_state=True,
+        )
+        torch.testing.assert_close(env.head_pitch(), torch.zeros(1), atol=1e-4, rtol=0)
+        paid_level = env._reward_components(level, action)[head_level]
+        turned = level.clone()
+        turned["qpos"][..., 3:7] = torch.tensor(
+            [math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4)]
+        )
+        env.reset(turned, set_state=True)
+        # Looking forward is relative to the body, not a fixed world heading.
+        torch.testing.assert_close(
+            env._reward_components(turned, action)[head_level], paid_level
+        )
+        env.reset(
+            TensorDict(qpos=nose_down["qpos"], qvel=nose_down["qvel"], batch_size=[1]),
+            set_state=True,
+        )
+        torch.testing.assert_close(
+            env.head_pitch(), torch.full((1,), -math.pi / 4), atol=1e-3, rtol=0
+        )
+        assert (
+            env._reward_components(nose_down, action)[head_level] < paid_level
+        ).all()
+        # Every preset keeps the head level by default.
+        assert (
+            MicroDuckEnv.standing_task().reward_weights[
+                list(MicroDuckEnv.REWARD_TERMS).index("head_level")
+            ]
+            == 1.0
+        )
+
+        # The turning task tracks its yaw rate in place of the yaw_rate cost.
+        turn = "diagnostic_reward_turn"
+        left = MicroDuckEnv.turning_task(1.0)
+        assert left.params["turn_rate"] == 1.0
+        assert (
+            left.reward_weights[list(MicroDuckEnv.REWARD_TERMS).index("yaw_rate")]
+            == 0.0
+        )
+        env.reset(TensorDict({"task_id": torch.tensor([[1]])}, batch_size=(1,)))
+        spinning_left, spinning_right = level.clone(), level.clone()
+        spinning_left["qvel"][..., 5] = 1.0
+        spinning_right["qvel"][..., 5] = -1.0
+        components = env._reward_components(spinning_left, action)
+        assert (
+            components[turn] > env._reward_components(spinning_right, action)[turn]
+        ).all()
+        env.reset(TensorDict({"task_id": torch.tensor([[2]])}, batch_size=(1,)))
+        assert (
+            env._reward_components(spinning_right, action)[turn]
+            > env._reward_components(spinning_left, action)[turn]
+        ).all()
+        env.close()
+
+    def test_microduck_register_reward_adds_a_weighted_term(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            MicroDuckEnv, "REWARD_TERMS", dict(MicroDuckEnv.REWARD_TERMS)
+        )
+        monkeypatch.setattr(
+            MicroDuckEnv, "REWARD_PARAMS", dict(MicroDuckEnv.REWARD_PARAMS)
+        )
+        stale = MicroDuckEnv.standing_task()
+
+        @MicroDuckEnv.register_reward(
+            "height_bonus", weight=1.0, per_second=False, height_bonus_scale=10.0
+        )
+        def height_bonus(features, params):
+            return params["height_bonus_scale"] * features["base_height"]
+
+        with pytest.raises(ValueError, match="already registered"):
+            MicroDuckEnv.register_reward("height_bonus")
+        # Tasks built before the registration lack the new weight.
+        with pytest.raises(ValueError, match="one entry per registered term"):
+            MicroDuckEnv.stack_tasks(stale)
+        task = MicroDuckEnv.standing_task(height_bonus_scale=20.0)
+        assert task.reward_weights[-1] == 1.0
+        assert task.params["height_bonus_scale"] == 20.0
+        env = MicroDuckEnv(
+            self._write_microduck_fixture(tmp_path),
+            backend="mujoco",
+            seed=0,
+            diagnostics=True,
+            tasks=[
+                task,
+                MicroDuckEnv.standing_task(reward_weights={"height_bonus": 0.0}),
+            ],
+        )
+        reset = env.reset(TensorDict({"task_id": torch.tensor([[0]])}, batch_size=(1,)))
+        step = env.step(reset.set("action", env.action_spec.zero()))
+        torch.testing.assert_close(
+            step["next", "diagnostic_reward_height_bonus"],
+            20.0 * step["next", "diagnostic_height"],
+        )
+        reset = env.reset(TensorDict({"task_id": torch.tensor([[1]])}, batch_size=(1,)))
+        step = env.step(reset.set("action", env.action_spec.zero()))
+        assert (step["next", "diagnostic_reward_height_bonus"] == 0).all()
+        env.close()
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_collision_meshes_use_runtime_proxies(self, tmp_path):
+        assets = tmp_path / "assets"
+        assets.mkdir()
+        (assets / "foot.obj").write_text(
+            "v -1 -2 -3\n"
+            "v 1 -2 -3\n"
+            "v 0 2 -3\n"
+            "v 0 0 3\n"
+            "f 1 3 2\n"
+            "f 1 2 4\n"
+            "f 2 3 4\n"
+            "f 3 1 4\n"
+        )
+        (tmp_path / "robot.xml").write_text(
+            "<mujoco><compiler meshdir='assets'/>"
+            "<default>"
+            "<default class='visual'><geom contype='0' conaffinity='0'/></default>"
+            "<default class='collision'><geom contype='1' conaffinity='1'/></default>"
+            "</default>"
+            "<asset><mesh name='foot' file='foot.obj'/></asset>"
+            "<worldbody><body><freejoint/>"
+            "<geom name='visual' class='visual' type='mesh' mesh='foot' mass='1'/>"
+            "<geom name='collision' class='collision' type='mesh' mesh='foot'/>"
+            "</body></worldbody></mujoco>"
+        )
+        scene = tmp_path / "scene.xml"
+        scene.write_text("<mujoco><include file='robot.xml'/></mujoco>")
+
+        original_model = mujoco.MjModel.from_xml_path(str(scene))
+        mesh_id = mujoco.mj_name2id(original_model, mujoco.mjtObj.mjOBJ_MESH, "foot")
+        start = original_model.mesh_vertadr[mesh_id]
+        stop = start + original_model.mesh_vertnum[mesh_id]
+        vertices = original_model.mesh_vert[start:stop]
+        expected_center = (vertices.max(axis=0) + vertices.min(axis=0)) / 2
+        expected_half_size = (vertices.max(axis=0) - vertices.min(axis=0)) / 2
+        rotated_center = np.zeros(3, dtype=np.float64)
+        original_collision_id = mujoco.mj_name2id(
+            original_model, mujoco.mjtObj.mjOBJ_GEOM, "collision"
+        )
+        mujoco.mju_rotVecQuat(
+            rotated_center,
+            expected_center,
+            original_model.geom_quat[original_collision_id],
+        )
+        expected_position = (
+            original_model.geom_pos[original_collision_id] + rotated_center
+        )
+        with _low_cost_collision_scene(scene) as patched_scene:
+            model = mujoco.MjModel.from_xml_path(str(patched_scene))
+        visual_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "visual")
+        collision_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "collision")
+        assert model.geom_type[visual_id] == mujoco.mjtGeom.mjGEOM_MESH
+        assert model.geom_type[collision_id] == mujoco.mjtGeom.mjGEOM_BOX
+        np.testing.assert_allclose(model.geom_size[collision_id], expected_half_size)
+        np.testing.assert_allclose(
+            model.geom_pos[collision_id], expected_position, atol=1e-7
+        )
+        np.testing.assert_allclose(
+            model.geom_quat[collision_id], original_model.geom_quat[collision_id]
+        )
+
+    @staticmethod
+    def _load_example(name: str):
+        """Import an example module from its file without touching sys.path."""
+        path = Path(__file__).parents[2] / "examples" / "microduck" / f"{name}.py"
+        module_name = f"microduck_example_{name}"
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_example_gait_metrics_from_contacts(self, tmp_path):
+        gait = self._load_example("heuristic_gait")
+        scene = self._write_microduck_fixture(tmp_path)
+        env = gait.make_env(scene, seed=0, max_episode_steps=30)
+        actor = gait.MicroDuckGaitActor()
+        rollout = env.rollout(30, actor, break_when_any_done=True)
+        assert rollout["action"].shape == (1, 30, 14)
+        assert (rollout["action"].abs() <= 1.0).all()
+        metrics = torch.stack(
+            [gait.gait_metrics(rollout), gait.gait_metrics(env.rollout(30, actor))]
+        )
+        # The fixture's feet never leave the ground, so forward motion alone
+        # must not be mistaken for walking.
+        assert (metrics["survived"] == 1.0).all()
+        assert (metrics["episode_length"] == 30.0).all()
+        assert (metrics["walking"] == 0.0).all()
+        assert (metrics["left_swing_phases"] == 0.0).all()
+        assert (metrics["left_single_support_steps"] == 0.0).all()
+        env.close()
+
+    def test_microduck_example_gait_metrics_count_swing_phases(self):
+        gait = self._load_example("heuristic_gait")
+        steps = 40
+        phase_start = gait.MicroDuckEnv.GAIT_PHASE_START
+        observation = torch.zeros(steps, gait.MicroDuckEnv.OBSERVATION_DIM)
+        observation[:, gait.MicroDuckEnv.COMMAND_START] = 0.2
+        # Five clock periods of eight steps: the left foot swings for the first
+        # four steps of each, the right foot for the last four.
+        clock = torch.arange(steps) % 8 < 4
+        observation[:, phase_start] = torch.where(clock, 1.0, -1.0)
+        left_contact = ~clock
+        rollout = TensorDict(
+            {
+                "observation": observation,
+                "next": TensorDict(
+                    {
+                        "observation": observation.roll(-1, 0) + 0.01,
+                        "terminated": torch.zeros(steps, 1, dtype=torch.bool),
+                        "diagnostic_left_foot_contact": left_contact.float()[:, None],
+                        "diagnostic_right_foot_contact": clock.float()[:, None],
+                        "diagnostic_left_foot_height": torch.full((steps, 1), 0.02),
+                        "diagnostic_right_foot_height": torch.full((steps, 1), 0.03),
+                    },
+                    batch_size=[steps],
+                ),
+            },
+            batch_size=[steps],
+        )
+        metrics = gait.gait_metrics(rollout)
+        assert metrics["left_swing_phases"] == 5.0
+        assert metrics["right_swing_phases"] == 5.0
+        assert metrics["left_single_support_steps"] == 20.0
+        assert metrics["right_foot_height_max"] == 0.03
+        assert metrics["walking"] == 1.0
+        # Three supporting steps per swing phase fall short of the minimum.
+        short = rollout.clone()
+        short["next", "diagnostic_right_foot_contact"][::8] = 0.0
+        short["next", "diagnostic_left_foot_contact"][4::8] = 0.0
+        assert gait.gait_metrics(short)["left_swing_phases"] == 0.0
+        assert gait.gait_metrics(short)["walking"] == 0.0
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    def test_microduck_example_recurrent_ppo_trains_on_whole_episodes(self, tmp_path):
+        ppo = self._load_example("ppo_mujoco")
+        scene = self._write_microduck_fixture(tmp_path)
+        env_cfg = {
+            "microduck_root": str(scene),
+            "backend": "mujoco",
+            "parallel": False,
+            "num_envs": 2,
+            "seed": 0,
+            "max_episode_steps": 20,
+            "device": "cpu",  # the models below are built on CPU
+            "action_scale": 0.5,
+            "tasks": [{"preset": "tracking_task", "speed": 0.03}],
+        }
+        assert ppo.task_labels(
+            ppo.make_tasks(
+                [
+                    {"preset": "jump_task"},
+                    {"preset": "sidestep_task", "speed": -0.15},
+                    {"preset": "jump_task", "name": "hop"},
+                ]
+            )
+        ) == ["jump", "sidestep-0.15", "hop"]
+        with pytest.raises(ValueError, match="preset"):
+            ppo.make_tasks([{"preset": "fly_task"}])
+        env = ppo.make_env(env_cfg)
+        # The prior head: its zero-initialized residual makes the first policy
+        # the closed-form gait, which the assertion below checks.
+        actor, critic = ppo.make_models(
+            env, hidden_size=16, policy_head="gait-residual"
+        )
+        evaluator = ppo.make_evaluator(
+            ppo.make_env({**env_cfg, "seed": 1, "task_id": 0}, num_envs=1),
+            actor,
+            label="tracking+0.03",
+            num_episodes=1,
+            steps=5,
+        )
+        with set_exploration_type(ExplorationType.DETERMINISTIC):
+            reset = env.reset()
+            actor(reset)
+        # The zero-initialized residual makes the first policy the closed-form gait.
+        torch.testing.assert_close(
+            reset["action"],
+            ppo.MicroDuckGaitActor().gait_action(reset["observation"]),
+            atol=1e-5,
+            rtol=0,
+        )
+        parameters_before = [p.detach().clone() for p in actor.parameters()]
+        history = ppo.train_ppo(
+            env,
+            actor,
+            critic,
+            total_transitions=150,
+            transitions_per_update=100,
+            max_episode_steps=20,
+            epochs=2,
+            minibatch_trajectories=2,
+        )
+        assert len(history) == 2
+        for metrics in history:
+            # Only complete 20-step episodes reach the buffer.
+            assert metrics["collection/transitions"] % 20 == 0
+            assert metrics["collection/transitions"] >= 100
+            assert (
+                metrics["collection/trajectories"]
+                == metrics["collection/transitions"] / 20
+            )
+            assert metrics["episode/length_min"] == 20.0
+            assert math.isfinite(metrics["ppo/loss_objective"])
+            assert math.isfinite(metrics["ppo/kl_approx"])
+        assert any(
+            not torch.equal(before, after)
+            for before, after in zip(parameters_before, actor.parameters())
+        )
+
+        # With evaluation enabled, the best-scoring parameters are checkpointed
+        # and restored into the actor at the end of training.
+        checkpoint = tmp_path / "best.ckpt"
+        history = ppo.train_ppo(
+            env,
+            actor,
+            critic,
+            total_transitions=100,
+            transitions_per_update=100,
+            max_episode_steps=20,
+            epochs=1,
+            minibatch_trajectories=2,
+            evaluators=[evaluator],
+            evaluation_interval=1,
+            best_checkpoint_path=checkpoint,
+            latest_checkpoint_path=tmp_path / "latest.ckpt",
+            policy_kwargs={"hidden_size": 16, "policy_head": "gait-residual"},
+            config={"env": env_cfg},
+        )
+        assert history[0]["evaluation/tracking+0.03/num_episodes"] == 1
+        assert "evaluation/survival_rate" in history[0]
+        # Checkpoints are unified TorchRL checkpoints in the rlrender layout.
+        latest = load_checkpoint(tmp_path / "latest.ckpt")
+        assert latest["frames"] >= 100
+        saved = load_checkpoint(checkpoint)
+        for name, parameter in actor.state_dict().items():
+            torch.testing.assert_close(parameter, saved["model_state_dict"][name])
+        # rlrender rebuilds the actor and the env from the recorded config.
+        render_env = ppo.make_env(checkpoint=saved, microduck_root=scene, num_envs=1)
+        rendered = ppo.make_render_policy(render_env, checkpoint=saved)
+        rendered.load_state_dict(saved["model_state_dict"])
+        assert render_env.observation_spec["recurrent_state"].shape[-1] == 16
+        assert render_env.base_env.action_scale == 0.5
+        assert (
+            render_env.base_env.tasks == MicroDuckEnv.tracking_task(0.03).unsqueeze(0)
+        ).all()
+        render_env.close()
+        # policy.init_from restores the trained parameters into fresh models.
+        fresh_actor, fresh_critic = ppo.make_models(
+            env, hidden_size=16, policy_head="gait-residual"
+        )
+        assert (
+            ppo.load_parameters(tmp_path / "latest.ckpt", fresh_actor, fresh_critic)
+            >= 100
+        )
+        for name, parameter in fresh_actor.state_dict().items():
+            torch.testing.assert_close(parameter, latest["model_state_dict"][name])
+        assert saved["metrics"][
+            "evaluation/tracking+0.03/forward_speed"
+        ] == pytest.approx(saved["metrics"]["evaluation/forward_speed"])
+        # A short forward fall with a huge return ranks below a full episode.
+        walked = {
+            "evaluation/tracking+0.03/reward": 1.0,
+            "evaluation/tracking+0.03/num_episodes": 1,
+            "evaluation/tracking+0.03/custom/survival_rate": 1.0,
+            "evaluation/tracking+0.03/custom/episode_length_min": 500.0,
+            "evaluation/tracking+0.03/custom/task_score_min": 0.6,
+            "evaluation/tracking+0.03/custom/task_score": 0.6,
+        }
+        fell = {
+            **walked,
+            "evaluation/tracking+0.03/reward": 1e6,
+            "evaluation/tracking+0.03/custom/survival_rate": 0.0,
+            "evaluation/tracking+0.03/custom/episode_length_min": 100.0,
+        }
+        assert ppo.evaluation_score([walked]) > ppo.evaluation_score([fell])
+        evaluator.shutdown()
+        env.close()
+
+    @pytest.mark.parametrize("backend", _AVAILABLE_BACKENDS)
+    def test_geom_contacts_and_site_positions(self, tmp_path, backend):
+        xml = tmp_path / "ball.xml"
+        xml.write_text(
+            """<mujoco><option timestep="0.002"/><worldbody>
+            <geom name="ground" type="plane" size="1 1 0.1"/>
+            <body name="ball" pos="0 0 0.3"><freejoint/>
+            <geom name="ball" type="sphere" size="0.05" mass="1"/>
+            <site name="top" pos="0 0 0.05"/></body>
+            <body name="marker" pos="0.5 0 0.5">
+            <geom name="marker" type="sphere" size="0.02" contype="0" conaffinity="0"/>
+            </body>
+            <body name="arm" pos="-0.5 0 0.5"><joint name="hinge" axis="0 1 0"/>
+            <geom type="capsule" fromto="0 0 0 0.1 0 0" size="0.01"
+            contype="0" conaffinity="0"/></body>
+            </worldbody><actuator><motor joint="hinge" ctrlrange="-1 1"/>
+            </actuator></mujoco>"""
+        )
+
+        class _BallEnv(MujocoEnv):
+            def _compute_reward(self, state, action, next_state):
+                return torch.zeros(self.num_envs, 1, device=self.device)
+
+            def _compute_done(self, state, next_state):
+                return torch.zeros(
+                    self.num_envs, 1, dtype=torch.bool, device=self.device
+                )
+
+        num_envs = 1 if backend == "mujoco" else 2
+        env = _BallEnv(
+            xml_path=xml, backend=backend, num_envs=num_envs, reset_noise_scale=0.0
+        )
+        td = env.reset()
+        contacts = env.geom_contacts(["ball", "marker"])
+        assert contacts.shape == (num_envs, 2)
+        assert not contacts.any()
+        top = env.site_positions(["top"])
+        assert top.shape == (num_envs, 1, 3)
+        torch.testing.assert_close(
+            top[..., 2], torch.full((num_envs, 1), 0.35), atol=1e-3, rtol=0
+        )
+        for _ in range(60):
+            td["action"] = torch.zeros_like(env.action_spec.rand())
+            td = env.step(td)["next"]
+        contacts = env.geom_contacts(["ball", "marker"])
+        assert contacts[:, 0].all()
+        assert not contacts[:, 1].any()
+        top = env.site_positions(["top"])
+        torch.testing.assert_close(
+            top[..., 2], torch.full((num_envs, 1), 0.10), atol=1e-2, rtol=0
+        )
+        with pytest.raises(KeyError, match="no geom named"):
+            env.geom_contacts(["nope"])
+        env.close()
+
+    @pytest.mark.skipif(not _has_mujoco, reason="MuJoCo is not installed")
+    @pytest.mark.parametrize("parallel", [False, True])
+    def test_native_batched_workers_draw_distinct_reset_noise(self, parallel):
+        # Workers built from one seed used to replay the same reset noise.
+        env = HopperEnv(num_envs=2, seed=0, backend="mujoco", parallel=parallel)
+        twin = HopperEnv(num_envs=2, seed=0, backend="mujoco", parallel=parallel)
+        try:
+            observation = env.reset()["observation"]
+            assert not torch.equal(observation[0], observation[1])
+            torch.testing.assert_close(observation, twin.reset()["observation"])
+        finally:
+            env.close()
+            twin.close()
 
     @pytest.mark.skipif(not _has_mujoco_torch, reason="mujoco-torch not installed")
     def test_torch_backend_rollout_partial_reset(self):
@@ -907,8 +2145,8 @@ class TestMujoco:
             assert isinstance(env_b, ParallelEnv)
             assert env_a._metadata_from_workers
             assert env_b._metadata_from_workers
-            assert env_a._use_buffers is False
-            assert env_b._use_buffers is False
+            assert env_a._use_buffers
+            assert env_b._use_buffers
             assert env_a.batch_size == env_b.batch_size
         finally:
             env_a.close()
@@ -932,7 +2170,7 @@ class TestMujoco:
         env = HopperEnv(backend="mujoco", num_envs=2, seed=0)
         assert isinstance(env, ParallelEnv)
         assert env._metadata_from_workers
-        assert env._use_buffers is False
+        assert env._use_buffers
         td = env.rollout(3)
         assert torch.isfinite(td.get(("next", "reward"))).all()
         env.close()
@@ -1026,10 +2264,34 @@ class TestMujoco:
 
     @pytest.mark.skipif(not _has_mujoco_torch, reason="mujoco-torch not installed")
     def test_torch_backend_compile_smoke(self):
-        """``compile_step=True`` must not raise on the default backend."""
+        """``compile_step=True`` compiles the batched step as a single graph.
+
+        The backend compiles with ``fullgraph=True`` by default, so a graph
+        break raises here instead of silently splitting the step into eager
+        fragments.  The graph counter guards against recompiles across steps,
+        which would otherwise degrade into an eager fallback once Dynamo's
+        recompile limit is hit.
+        """
+        import torch._dynamo
+        import torch._dynamo.utils
+
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
         env = HopperEnv(num_envs=2, seed=0, compile_step=True)
-        td = env.rollout(3)
-        assert torch.isfinite(td.get(("next", "reward"))).all()
+        # Older mujoco-torch releases compile a solver while_loop during the
+        # eager reset forward pass. Count the physics-step graph separately.
+        env.reset()
+        reset_graphs = torch._dynamo.utils.counters["stats"].get("unique_graphs", 0)
+        # Both the first reset and later resets must retain the stepped layout.
+        for _ in range(2):
+            td = env.rollout(3)
+            assert torch.isfinite(td.get(("next", "reward"))).all()
+        unique_graphs = (
+            torch._dynamo.utils.counters["stats"].get("unique_graphs", 0) - reset_graphs
+        )
+        assert (
+            unique_graphs == 1
+        ), f"expected a single compiled graph, got {unique_graphs}"
 
     def test_unknown_backend_raises(self):
         with pytest.raises(ValueError, match="unknown backend"):
@@ -1708,21 +2970,33 @@ class TestMujoco:
         )
         env.close()
 
-    def test_xml_path_kwarg_overrides_class_attr(self, tmp_path):
-        """Custom ``xml_path=`` overrides the class-level :attr:`XML_PATH`."""
-        backend = _AVAILABLE_BACKENDS[0]
-        # A trivial single-hinge model -- pure-XML, no external mesh deps.
-        xml = (
-            "<mujoco><worldbody>"
-            "<body name='b' pos='0 0 1'>"
-            "<joint name='j' type='hinge'/>"
-            "<geom size='0.1' mass='1'/>"
+    @pytest.mark.parametrize("backend", _AVAILABLE_BACKENDS)
+    def test_xml_path_preserves_relative_assets(self, tmp_path, backend):
+        assets = tmp_path / "assets"
+        assets.mkdir()
+        (assets / "tetrahedron.obj").write_text(
+            "v 0 0 0\n"
+            "v 0.1 0 0\n"
+            "v 0 0.1 0\n"
+            "v 0 0 0.1\n"
+            "f 1 3 2\n"
+            "f 1 2 4\n"
+            "f 1 4 3\n"
+            "f 2 3 4\n"
+        )
+        (tmp_path / "robot.xml").write_text(
+            "<mujoco><compiler meshdir='assets'/>"
+            "<asset><mesh name='tetrahedron' file='tetrahedron.obj'/></asset>"
+            "<worldbody><body name='body' pos='0 0 1'>"
+            "<joint name='joint' type='hinge'/>"
+            "<geom type='sphere' size='0.1' mass='1'/>"
+            "<geom type='mesh' mesh='tetrahedron' contype='0' conaffinity='0'/>"
             "</body></worldbody>"
-            "<actuator><motor name='a' joint='j' gear='1' ctrlrange='-1 1'/></actuator>"
+            "<actuator><motor joint='joint' ctrlrange='-1 1'/></actuator>"
             "</mujoco>"
         )
-        path = tmp_path / "tiny.xml"
-        path.write_text(xml)
+        path = tmp_path / "scene.xml"
+        path.write_text("<mujoco><include file='robot.xml'/></mujoco>")
 
         class TinyEnv(MujocoEnv):
             FRAME_SKIP = 2
@@ -1735,10 +3009,18 @@ class TestMujoco:
                     self.num_envs, 1, dtype=torch.bool, device=self.device
                 )
 
-        env = TinyEnv(xml_path=str(path), backend=backend, num_envs=1, seed=0)
+        num_envs = 1 if backend == "mujoco" else 2
+        env = TinyEnv(
+            xml_path=path,
+            patch_xml=False,
+            backend=backend,
+            num_envs=num_envs,
+            seed=0,
+        )
         check_env_specs(env)
         td = env.rollout(3)
-        assert td.shape == torch.Size([1, 3])
+        assert td.shape == torch.Size([num_envs, 3])
+        assert torch.isfinite(td.get(("next", "observation"))).all()
 
 
 if __name__ == "__main__":

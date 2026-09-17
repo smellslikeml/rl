@@ -24,6 +24,7 @@ from torchrl.objectives import (
 )
 from torchrl.objectives.iql import DiscreteIQLLoss
 from torchrl.objectives.sac import DiscreteSACLoss
+from torchrl.objectives.value import GAE
 from torchrl.trainers.algorithms.configs.common import _normalize_hydra_key, ConfigBase
 
 
@@ -47,7 +48,9 @@ class SACLossConfig(LossConfig):
 
     Every kwarg accepted by ``SACLoss.__init__`` is exposed as a field here. The
     ``discrete``/``action_space``/``num_actions``/``target_entropy_weight`` fields
-    apply only when the discrete variant is selected.
+    apply only when the discrete variant is selected, and the
+    ``value_network``/``action_spec``/``delay_actor``/``delay_value`` fields only
+    when it is not.
     """
 
     actor_network: Any = None
@@ -100,8 +103,14 @@ def _make_sac_loss(*args, **kwargs) -> SACLoss:
         kwargs["value_network"] = value_network()
 
     if discrete_loss_type:
+        # DiscreteSACLoss has no value network, action spec or delayed actor/value.
+        for key in ("value_network", "action_spec", "delay_actor", "delay_value"):
+            kwargs.pop(key, None)
         loss = DiscreteSACLoss(*args, **kwargs)
     else:
+        # SACLoss has no `action_space`, `num_actions` or `target_entropy_weight` kwarg.
+        for key in ("action_space", "num_actions", "target_entropy_weight"):
+            kwargs.pop(key, None)
         loss = SACLoss(*args, **kwargs)
     if gamma is not None:
         loss.make_value_estimator(gamma=gamma)
@@ -155,6 +164,7 @@ class PPOLossConfig(LossConfig):
     loss_critic_type: str = "smooth_l1"
     normalize_advantage: bool = False
     normalize_advantage_exclude_dims: tuple = ()
+    advantage_norm: Any = None
     gamma: float | None = None
     separate_losses: bool = False
     advantage_key: str | None = None
@@ -165,6 +175,8 @@ class PPOLossConfig(LossConfig):
     critic: Any = None
     reduction: str | None = None
     clip_value: float | None = None
+    delay_actor: bool = False
+    max_importance_ratio: float | None = None
     # float for symmetric clipping or a (low, high) pair for DAPO-style
     # asymmetric clipping (ClipPPOLoss only)
     clip_epsilon: Any = 0.2
@@ -184,6 +196,10 @@ class PPOLossConfig(LossConfig):
 def _make_ppo_loss(*args, **kwargs) -> PPOLoss:
     loss_type = kwargs.pop("loss_type", "clip")
     gamma = kwargs.pop("gamma", None)
+    # Instantiate the advantage normaliser if it is a config object
+    advantage_norm = kwargs.get("advantage_norm")
+    if advantage_norm is not None and hasattr(advantage_norm, "_target_"):
+        kwargs["advantage_norm"] = advantage_norm()
     # Drop kwargs that don't apply to the chosen loss flavor so each class
     # receives only what its __init__ accepts.
     clip_only = {"clip_epsilon"}
@@ -238,6 +254,7 @@ class A2CLossConfig(LossConfig):
     entropy_coeff: float | None = None
     critic_coeff: float = 1.0
     loss_critic_type: str = "smooth_l1"
+    advantage_norm: Any = None
     gamma: float | None = None
     separate_losses: bool = False
     advantage_key: Any = None
@@ -268,6 +285,9 @@ def _make_onpolicy_loss(loss_cls, *args, **kwargs):
         kwargs["actor_network"] = actor_network()
     if critic_network is not None and hasattr(critic_network, "_target_"):
         kwargs["critic_network"] = critic_network()
+    advantage_norm = kwargs.get("advantage_norm")
+    if advantage_norm is not None and hasattr(advantage_norm, "_target_"):
+        kwargs["advantage_norm"] = advantage_norm()
 
     loss = loss_cls(*args, **kwargs)
     if gamma is not None:
@@ -391,6 +411,11 @@ class HardUpdateConfig(TargetNetUpdaterConfig):
     value_network_update_interval: int = 1000
 
 
+def _make_gae(*args, **kwargs) -> GAE:
+    group_key = _normalize_hydra_key(kwargs.pop("group_key", None))
+    return GAE(*args, group_key=group_key, **kwargs)
+
+
 @dataclass
 class GAEConfig(LossConfig):
     """Hydra configuration for :class:`~torchrl.objectives.value.GAE`.
@@ -418,7 +443,8 @@ class GAEConfig(LossConfig):
     num_chunk: int | None = None
     value_chunk_dim: int = 0
     shifted_budget: int = 1
-    _target_: str = "torchrl.objectives.value.GAE"
+    group_key: Any = None
+    _target_: str = "torchrl.trainers.algorithms.configs.objectives._make_gae"
     _partial_: bool = False
 
     def __post_init__(self) -> None:
@@ -683,3 +709,29 @@ def _make_cql_loss(*args, **kwargs) -> CQLLoss:
     if gamma is not None:
         loss.make_value_estimator(gamma=gamma)
     return loss
+
+
+@dataclass
+class DreamerV3LossConfig(LossConfig):
+    """Hydra configuration for :class:`~torchrl.objectives.DreamerV3Loss`.
+
+    Examples:
+        With the component losses from the ``DreamerV3Loss`` example:
+
+        >>> from hydra.utils import instantiate
+        >>> from torchrl.trainers.algorithms.configs import DreamerV3LossConfig
+        >>> configured_loss = instantiate(
+        ...     DreamerV3LossConfig(), model_loss=model_loss,
+        ...     actor_loss=actor_loss, value_loss=value_loss,
+        ... )
+        >>> losses = configured_loss(sample)
+        >>> assert not losses["replay_context", "state"].requires_grad
+    """
+
+    model_loss: Any = None
+    actor_loss: Any = None
+    value_loss: Any = None
+    replay_value_loss_weight: float = 0.3
+    continuation_horizon: float = 333.0
+    lmbda: float = 0.95
+    _target_: str = "torchrl.objectives.DreamerV3Loss"

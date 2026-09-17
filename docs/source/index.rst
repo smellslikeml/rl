@@ -118,9 +118,12 @@ Intermediate
    tutorials/dqn_with_rnn
    tutorials/recurrent_sequence_training
    tutorials/mujoco_cube_bowl_macros
+   tutorials/microduck
    tutorials/collector_trajectory_assembly
    tutorials/evaluator
+   tutorials/rlrender
    tutorials/rb_tutorial
+   tutorials/checkpointing
    tutorials/memory_efficient_rl
    tutorials/export
    tutorials/vla
@@ -135,6 +138,7 @@ Advanced
    tutorials/multi_task
    tutorials/coding_ddpg
    tutorials/coding_dqn
+   tutorials/trl_interop
 
 References
 ==========

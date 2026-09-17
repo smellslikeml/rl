@@ -14,6 +14,7 @@ from functools import partial
 import pytest
 import torch
 import torch.nn.functional as F
+from pyvers import implement_for
 
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import (
@@ -38,16 +39,14 @@ from torchrl.modules.distributions import (
     MaskedOneHotCategorical,
     TanhDelta,
 )
-from torchrl.modules.distributions.continuous import (
-    SafeTanhTransform,
-    TORCH_VERSION_PRE_2_6,
-)
+from torchrl.modules.distributions.continuous import SafeTanhTransform
 from torchrl.modules.distributions.discrete import (
     _generate_ordinal_logits,
     LLMMaskedCategorical,
 )
 from torchrl.modules.distributions.utils import (
     composite_entropy,
+    has_analytic_kl,
     rsample_and_log_prob,
     sample_and_log_prob,
 )
@@ -55,6 +54,24 @@ from torchrl.modules.distributions.utils import (
 from torchrl.testing import get_default_devices
 
 _has_scipy = importlib.util.find_spec("scipy", None) is not None
+
+
+def test_has_analytic_kl_observes_late_registration():
+    class FirstDistribution(torch.distributions.Distribution):
+        pass
+
+    class SecondDistribution(torch.distributions.Distribution):
+        pass
+
+    first = FirstDistribution()
+    second = SecondDistribution()
+    assert not has_analytic_kl(first, second)
+
+    @torch.distributions.register_kl(FirstDistribution, SecondDistribution)
+    def _registered_kl(first, second):
+        return torch.zeros(first.batch_shape)
+
+    assert has_analytic_kl(first, second)
 
 
 @pytest.mark.skipif(torch.__version__ < "2.0", reason="torch 2.0 is required")
@@ -177,18 +194,37 @@ class TestTanhNormal:
             lp = d.log_prob(a)
             assert torch.isfinite(lp).all()
 
+    @implement_for("torch", None, "2.6.0", compilable=True)
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("low, high", [(-1.0, 1.0), (-2.0, 3.0)])
+    @pytest.mark.parametrize("safe_tanh", [False, True])
+    @pytest.mark.parametrize("compiled", [False])
+    @pytest.mark.parametrize("device", get_default_devices())
+    def test_tanhnormal_rsample_and_log_prob(
+        self, dtype, low, high, safe_tanh, compiled, device
+    ):
+        self._test_tanhnormal_rsample_and_log_prob(
+            dtype, low, high, safe_tanh, compiled, device
+        )
+
+    @implement_for("torch", "2.6.0", compilable=True)
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
     @pytest.mark.parametrize("low, high", [(-1.0, 1.0), (-2.0, 3.0)])
     @pytest.mark.parametrize("safe_tanh", [False, True])
     @pytest.mark.parametrize("compiled", [False, True])
     @pytest.mark.parametrize("device", get_default_devices())
-    def test_tanhnormal_rsample_and_log_prob(
+    def test_tanhnormal_rsample_and_log_prob(  # noqa: F811
+        self, dtype, low, high, safe_tanh, compiled, device
+    ):
+        self._test_tanhnormal_rsample_and_log_prob(
+            dtype, low, high, safe_tanh, compiled, device
+        )
+
+    def _test_tanhnormal_rsample_and_log_prob(
         self, dtype, low, high, safe_tanh, compiled, device
     ):
         if compiled and sys.version_info >= (3, 14):
             pytest.skip("torch.compile requires Python < 3.14")
-        if compiled and safe_tanh and TORCH_VERSION_PRE_2_6:
-            pytest.skip("safe_tanh compilation requires torch 2.6+")
 
         magnitude = 20.0 if dtype is torch.float32 else 40.0
         loc = torch.tensor(

@@ -16,8 +16,10 @@ from torchrl.data import (
     LazyTensorStorage,
     ListStorage,
     ReplayBuffer,
+    ReplayBufferEnsemble,
     TensorDictPrioritizedReplayBuffer,
     TensorDictReplayBuffer,
+    TensorDictRoundRobinWriter,
 )
 from torchrl.data.replay_buffers import (
     PrioritizedSampler,
@@ -27,6 +29,7 @@ from torchrl.data.replay_buffers import (
     SamplerWithoutReplacement,
     Sequence,
     SliceSampler,
+    StreamingSliceSampler,
 )
 from torchrl.data.replay_buffers.utils import _boundary_distances_1d
 from torchrl.envs.transforms import ActionChunkTransform, CatFrames
@@ -78,6 +81,49 @@ def populate(rb, td):
 
 def sample(rb):
     rb.sample()
+
+
+@pytest.mark.parametrize("operation", ["write", "sample"])
+def test_routed_streaming_replay_buffer(benchmark, operation):
+    num_streams = 8
+    time = 32
+    slice_len = 4
+    members = [
+        TensorDictReplayBuffer(
+            storage=LazyTensorStorage(1_024),
+            sampler=StreamingSliceSampler(slice_len=slice_len),
+            writer=TensorDictRoundRobinWriter(track_generations=True),
+        )
+        for _ in range(num_streams)
+    ]
+    rb = ReplayBufferEnsemble(
+        *members,
+        routing_dim=1,
+        p="sampleable",
+        num_buffer_sampled=64,
+        batch_size=64 * slice_len,
+    )
+    data = TensorDict(
+        {
+            "observation": torch.randn(time, num_streams, 32),
+            ("next", "done"): torch.zeros(time, num_streams, 1, dtype=torch.bool),
+        },
+        [time, num_streams],
+    )
+
+    def prepare_write():
+        rb.empty()
+        return (data,), {}
+
+    def prepare_sample():
+        rb.empty()
+        rb.extend(data)
+        return (rb,), {}
+
+    if operation == "write":
+        benchmark.pedantic(rb.extend, setup=prepare_write, rounds=50)
+    else:
+        benchmark.pedantic(sample, setup=prepare_sample, rounds=50)
 
 
 def _replay_boundary_device():
@@ -162,6 +208,112 @@ def test_slice_sampler_boundary_query_benchmark(
         end_key=("next", "done"),
     )
     benchmark(sampler._get_stop_and_length, rb.storage)
+
+
+@pytest.mark.parametrize(
+    "cache_state",
+    [
+        pytest.param("hot", id="hot-cache"),
+        pytest.param("write_invalidated", id="write-invalidated"),
+        pytest.param("cold", id="cold-start"),
+    ],
+)
+@pytest.mark.parametrize(
+    "layout",
+    [
+        pytest.param("contiguous", id="contiguous"),
+        pytest.param("shuffled", id="fragmented-shuffled"),
+    ],
+)
+@pytest.mark.parametrize("size", [1_000, 100_000])
+def test_slice_sampler_sample(benchmark, size, layout, cache_state):
+    device = _replay_boundary_device()
+    num_trajectories = 8
+    trajectory_length = size // num_trajectories
+    logical_order = torch.arange(size, device=device)
+    trajectory = logical_order // trajectory_length
+    step = logical_order % trajectory_length
+    fragmented = layout == "shuffled"
+    if fragmented:
+        # Preserve the logical trajectories while changing only their physical layout.
+        permutation = torch.randperm(
+            size,
+            device=device,
+            generator=torch.Generator(device=device).manual_seed(0),
+        )
+        trajectory = trajectory[permutation]
+        step = step[permutation]
+    data = TensorDict(
+        {
+            "trajectory": trajectory,
+            "step": step,
+        },
+        [size],
+        device=device,
+    )
+
+    def make_replay_buffer():
+        rb = TensorDictReplayBuffer(
+            storage=LazyTensorStorage(size, device=device),
+            sampler=SliceSampler(
+                slice_len=8,
+                traj_key="trajectory",
+                step_key="step",
+                cache_values=True,
+                fragmented=fragmented,
+            ),
+            batch_size=256,
+            generator=torch.Generator(device=device).manual_seed(0),
+        )
+        rb.extend(data)
+        return rb
+
+    rb = make_replay_buffer()
+    sample = rb.sample().reshape(-1, 8)
+    assert (sample["trajectory"] == sample["trajectory"][:, :1]).all()
+    assert (sample["step"].diff(dim=1) == 1).all()
+
+    def sample_replay_buffer(rb):
+        rb.sample()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    if cache_state == "cold":
+
+        def cold_setup():
+            cold_rb = make_replay_buffer()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            return (cold_rb,), {}
+
+        benchmark.pedantic(
+            sample_replay_buffer,
+            setup=cold_setup,
+            rounds=10,
+        )
+    elif cache_state == "write_invalidated":
+        next_write = 0
+
+        def write_setup():
+            nonlocal next_write
+            rb.add(data[next_write])
+            next_write = (next_write + 1) % size
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            return (rb,), {}
+
+        benchmark.pedantic(
+            sample_replay_buffer,
+            setup=write_setup,
+            rounds=25,
+        )
+    else:
+        benchmark.pedantic(
+            sample_replay_buffer,
+            args=(rb,),
+            rounds=200,
+            iterations=10,
+        )
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -415,6 +567,21 @@ def test_rb_sample(benchmark, rb, storage, sampler, size):
     )()
     torch.manual_seed(0)
     benchmark(sample, rb)
+
+
+@pytest.mark.parametrize("storage", [LazyTensorStorage, LazyMemmapStorage])
+@pytest.mark.parametrize("size", [10_000, 100_000])
+def test_rb_checkpoint_dump(benchmark, tmp_path, storage, size):
+    # Cost of one scheduled replay-buffer checkpoint; informs the default
+    # trainer save cadence when the buffer is included.
+    (rb,), _ = create_rb(
+        rb=TensorDictReplayBuffer,
+        storage=storage,
+        sampler=None,
+        populated=True,
+        size=size,
+    )()
+    benchmark(rb.dumps, tmp_path / "checkpoint")
 
 
 @pytest.mark.parametrize("size", [1_000, 100_000])

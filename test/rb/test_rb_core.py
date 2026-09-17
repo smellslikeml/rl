@@ -10,6 +10,7 @@ import functools
 import json
 import pickle
 import threading
+import warnings
 
 import pytest
 import torch
@@ -652,9 +653,29 @@ def test_add_warning():
         rb.add(TensorDict(batch_size=[1]))
 
 
+def test_sample_batch_size_conflict_warns_once():
+    rb = ReplayBuffer(storage=ListStorage(10), batch_size=2)
+    rb.extend(torch.arange(10))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        rb.sample(3)
+        rb.sample(4)
+
+    conflicts = [
+        warning
+        for warning in caught
+        if "Got conflicting batch_sizes" in str(warning.message)
+    ]
+    assert len(conflicts) == 1
+
+
 @pytest.mark.parametrize("stack", [False, True])
 @pytest.mark.parametrize("reduction", ["min", "max", "mean", "median"])
 def test_rb_trajectories(stack, reduction):
+    priorities = torch.tensor(
+        [[1.0, 2.0, 4.0, 8.0], [2.0, 5.0, 6.0, 9.0], [3.0, 7.0, 10.0, 20.0]]
+    )
     traj_td = TensorDict(
         {"obs": torch.randn(3, 4, 5), "actions": torch.randn(3, 4, 2)},
         batch_size=[3, 4],
@@ -663,25 +684,35 @@ def test_rb_trajectories(stack, reduction):
         traj_td = torch.stack([td.to_tensordict() for td in traj_td], 0)
 
     rb = TensorDictPrioritizedReplayBuffer(
-        alpha=0.7,
-        beta=0.9,
+        alpha=1.0,
+        beta=1.0,
         priority_key="td_error",
         storage=ListStorage(5),
-        batch_size=3,
+        batch_size=24,
+        reduction=reduction,
+        generator=torch.Generator().manual_seed(0),
     )
     rb.extend(traj_td)
-    sampled_td = rb.sample()
-    sampled_td.set("td_error", torch.rand(3, 4))
-    rb.update_tensordict_priority(sampled_td)
-    sampled_td = rb.sample(include_info=True)
-    assert (sampled_td.get("priority_weight") > 0).all()
-    assert sampled_td.batch_size == torch.Size([3, 4])
+    update = traj_td.clone().set("index", torch.arange(3).view(3, 1).expand(3, 4))
+    update.set("td_error", priorities)
+    rb.update_tensordict_priority(update)
 
-    # set back the trajectory length
-    sampled_td_filtered = sampled_td.to_tensordict().exclude(
-        "priority_weight", "index", "td_error"
+    reduced_priorities = {
+        "min": priorities.min(-1).values,
+        "max": priorities.max(-1).values,
+        "mean": priorities.mean(-1),
+        "median": priorities.median(-1).values,
+    }[reduction]
+    expected_weights = (reduced_priorities / reduced_priorities.min()).pow(-1)
+    sampled_td = rb.sample()
+    indices = sampled_td["index"][:, 0]
+    assert indices.unique().numel() == 3
+    torch.testing.assert_close(
+        sampled_td["priority_weight"],
+        expected_weights[indices]
+        .unsqueeze(-1)
+        .expand_as(sampled_td["priority_weight"]),
     )
-    sampled_td_filtered.batch_size = [3, 4]
 
 
 def test_shared_storage_prioritized_sampler():
@@ -1217,6 +1248,47 @@ class _BlockingPrefetchCollate:
         return torch.stack(data)
 
 
+class _OrderedUpdateReplayBuffer(TensorDictReplayBuffer):
+    def __init__(self, **kwargs):
+        self.events = []
+        self.prefetch_started = threading.Event()
+        self.release_prefetch = threading.Event()
+        self.update_started = threading.Event()
+        self.release_update = threading.Event()
+        self.sample_after_update_started = threading.Event()
+        self.sample_after_update = None
+        self._sample_calls = 0
+        self._sample_calls_lock = threading.Lock()
+        super().__init__(**kwargs)
+
+    def _sample(self, batch_size):
+        with self._sample_calls_lock:
+            self._sample_calls += 1
+            call = self._sample_calls
+        self.events.append(f"sample-{call}-start")
+        if call in (2, 3):
+            if call == 3:
+                self.prefetch_started.set()
+            if not self.release_prefetch.wait(timeout=5):
+                raise RuntimeError("Timed out waiting to release prefetched samples.")
+        elif call >= 4:
+            self.sample_after_update_started.set()
+        result = super()._sample(batch_size)
+        if call >= 4:
+            self.sample_after_update = result[0]
+        self.events.append(f"sample-{call}-end")
+        return result
+
+    def update_if_present(self, **kwargs):
+        self.events.append("update-start")
+        self.update_started.set()
+        if not self.release_update.wait(timeout=5):
+            raise RuntimeError("Timed out waiting to release the update.")
+        result = super().update_if_present(**kwargs)
+        self.events.append("update-end")
+        return result
+
+
 def _make_replay_buffer_with_blocked_prefetch(seed=0):
     collate = _BlockingPrefetchCollate()
     replay_buffer = ReplayBuffer(
@@ -1230,6 +1302,231 @@ def _make_replay_buffer_with_blocked_prefetch(seed=0):
     replay_buffer.sample()
     assert collate.prefetch_started.wait(timeout=5)
     return replay_buffer, collate
+
+
+@pytest.mark.parametrize(
+    ("key", "overwrite"), [("obs", False), (("latent", "state"), True)]
+)
+def test_replay_buffer_orders_submitted_updates_with_prefetch(key, overwrite):
+    replay_buffer = _OrderedUpdateReplayBuffer(
+        storage=LazyTensorStorage(8),
+        writer=TensorDictRoundRobinWriter(track_generations=True),
+        batch_size=8,
+        prefetch=2,
+    )
+    index = replay_buffer.extend(TensorDict({key: torch.zeros(8)}, batch_size=[8]))
+    generation = replay_buffer.writer.generations_of(index)
+    replay_buffer.sample()
+    assert replay_buffer.prefetch_started.wait(timeout=5)
+
+    future = replay_buffer.submit_update_if_present(
+        index=index,
+        generation=generation,
+        patch={key: torch.ones(8)},
+    )
+    assert not replay_buffer.update_started.wait(timeout=0.05)
+    replay_buffer.release_prefetch.set()
+    assert replay_buffer.update_started.wait(timeout=5)
+
+    # Consume the two samples that preceded the update. Their replacements
+    # have been submitted but must wait for the update barrier.
+    replay_buffer.sample()
+    replay_buffer.sample()
+    sample_thread = threading.Thread(target=replay_buffer.sample)
+    sample_thread.start()
+    assert not replay_buffer.sample_after_update_started.wait(timeout=0.05)
+
+    if overwrite:
+        replay_buffer.extend(TensorDict({key: torch.full((8,), 3.0)}, batch_size=[8]))
+    replay_buffer.release_update.set()
+    sample_thread.join(timeout=5)
+    assert not sample_thread.is_alive()
+    assert future.result(timeout=5).updated_count == (0 if overwrite else 8)
+    assert (replay_buffer.sample_after_update[key] == (3 if overwrite else 1)).all()
+    assert max(
+        replay_buffer.events.index("sample-2-end"),
+        replay_buffer.events.index("sample-3-end"),
+    ) < replay_buffer.events.index("update-start")
+    assert replay_buffer.events.index("update-end") < replay_buffer.events.index(
+        "sample-4-start"
+    )
+    replay_buffer.shutdown()
+
+
+def test_replay_buffer_synchronize_keeps_prefetched_results_and_checkpoints_updates():
+    replay_buffer = TensorDictReplayBuffer(
+        storage=LazyTensorStorage(8),
+        writer=TensorDictRoundRobinWriter(track_generations=True),
+        batch_size=4,
+        prefetch=2,
+        generator=torch.Generator().manual_seed(0),
+    )
+    index = replay_buffer.extend(TensorDict({"obs": torch.zeros(8)}, batch_size=[8]))
+    generation = replay_buffer.writer.generations_of(index)
+    replay_buffer.sample()
+    queued = len(replay_buffer._prefetch_queue)
+    prefetched = []
+    for queued_future in replay_buffer._prefetch_queue:
+        queued_data, queued_info = queued_future.result()
+        prefetched.append((queued_data.clone(), queued_info["index"].clone()))
+    future = replay_buffer.submit_update_if_present(
+        index=index,
+        generation=generation,
+        patch={"obs": torch.ones(8)},
+    )
+
+    replay_buffer.synchronize()
+    assert future.result().updated_count == 8
+    assert len(replay_buffer._prefetch_queue) == queued
+    for expected_data, expected_index in prefetched:
+        actual_data, actual_info = replay_buffer.sample(return_info=True)
+        assert_allclose_td(actual_data.select("obs"), expected_data.select("obs"))
+        assert torch.equal(actual_info["index"], expected_index)
+
+    second = replay_buffer.submit_update_if_present(
+        index=index,
+        generation=generation,
+        patch={"obs": torch.full((8,), 2.0)},
+    )
+    state = replay_buffer.state_dict()
+    assert second.done()
+
+    restored = TensorDictReplayBuffer(
+        storage=LazyTensorStorage(8),
+        writer=TensorDictRoundRobinWriter(track_generations=True),
+        batch_size=4,
+        prefetch=2,
+    )
+    restored.load_state_dict(state)
+    assert (restored[:]["obs"] == 2).all()
+    assert len(restored._prefetch_queue) == queued
+    replay_buffer.shutdown()
+    restored.shutdown()
+
+
+def test_replay_buffer_shutdown_propagates_update_errors_and_is_idempotent():
+    replay_buffer = TensorDictReplayBuffer(
+        storage=LazyTensorStorage(4),
+        writer=TensorDictRoundRobinWriter(track_generations=True),
+    )
+    index = replay_buffer.extend(TensorDict({"obs": torch.zeros(4)}, batch_size=[4]))
+    generation = replay_buffer.writer.generations_of(index)
+    future = replay_buffer.submit_update_if_present(
+        index=index,
+        generation=generation,
+        patch={"missing": torch.ones(4)},
+    )
+
+    with pytest.raises(KeyError, match="missing"):
+        replay_buffer.shutdown()
+    assert future.done()
+    assert not replay_buffer.is_alive
+    replay_buffer.shutdown()
+    with pytest.raises(RuntimeError, match="cannot accept updates"):
+        replay_buffer.submit_update_if_present(
+            index=index, generation=generation, patch={"obs": torch.ones(4)}
+        )
+    with pytest.raises(RuntimeError, match="cannot be sampled"):
+        replay_buffer.sample(1)
+
+
+class _RecordingUpdateReplayBuffer(TensorDictReplayBuffer):
+    def __init__(self, **kwargs):
+        self.seen = []
+        super().__init__(**kwargs)
+
+    def update_if_present(self, **kwargs):
+        self.seen.append(kwargs)
+        return super().update_if_present(**kwargs)
+
+
+def test_submit_update_if_present_passes_cpu_inputs_through():
+    replay_buffer = _RecordingUpdateReplayBuffer(
+        storage=LazyTensorStorage(4),
+        writer=TensorDictRoundRobinWriter(track_generations=True),
+    )
+    index = replay_buffer.extend(TensorDict({"obs": torch.zeros(4)}, batch_size=[4]))
+    generation = replay_buffer.writer.generations_of(index)
+    patch = {"obs": torch.arange(4.0)}
+    try:
+        result = replay_buffer.submit_update_if_present(
+            index=index, generation=generation, patch=patch
+        ).result(timeout=5)
+        assert result.updated_count == 4
+        (seen,) = replay_buffer.seen
+        assert seen["index"] is index
+        assert seen["generation"] is generation
+        assert seen["patch"]["obs"] is patch["obs"]
+        assert torch.equal(replay_buffer[:]["obs"], patch["obs"])
+    finally:
+        replay_buffer.shutdown()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("patch_type", ["dict", "tensordict"])
+def test_submit_update_if_present_stages_cuda_inputs_for_cpu_storage(patch_type):
+    replay_buffer = _RecordingUpdateReplayBuffer(
+        storage=LazyTensorStorage(4),
+        writer=TensorDictRoundRobinWriter(track_generations=True),
+    )
+    index = replay_buffer.extend(
+        TensorDict({"obs": torch.zeros(4), "aux": torch.zeros(4, 2)}, batch_size=[4])
+    )
+    generation = replay_buffer.writer.generations_of(index)
+    obs = torch.arange(4.0, device="cuda")
+    aux = torch.arange(8.0, device="cuda").reshape(4, 2)
+    if patch_type == "dict":
+        patch = {"obs": obs, "aux": aux}
+    else:
+        patch = TensorDict({"obs": obs, "aux": aux}, batch_size=[4])
+    try:
+        # Work enqueued after submission must not be able to change what the
+        # update writes: the staged copies were ordered before it.
+        future = replay_buffer.submit_update_if_present(
+            index=index.cuda(), generation=generation.cuda(), patch=patch
+        )
+        obs.add_(100)
+        aux.add_(100)
+        assert future.result(timeout=5).updated_count == 4
+        (seen,) = replay_buffer.seen
+        staged = [seen["index"], seen["generation"]]
+        staged.extend(
+            seen["patch"].values()
+            if patch_type == "dict"
+            else seen["patch"].values(True, True)
+        )
+        for value in staged:
+            assert value.device.type == "cpu"
+            assert value.is_pinned()
+        assert torch.equal(replay_buffer[:]["obs"], torch.arange(4.0))
+        assert torch.equal(replay_buffer[:]["aux"], torch.arange(8.0).reshape(4, 2))
+    finally:
+        replay_buffer.shutdown()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_submit_update_if_present_keeps_cuda_inputs_for_cuda_storage():
+    replay_buffer = _RecordingUpdateReplayBuffer(
+        storage=LazyTensorStorage(4, device="cuda"),
+        writer=TensorDictRoundRobinWriter(track_generations=True),
+    )
+    index = replay_buffer.extend(
+        TensorDict({"obs": torch.zeros(4, device="cuda")}, batch_size=[4])
+    )
+    generation = replay_buffer.writer.generations_of(index)
+    patch = {"obs": torch.arange(4.0, device="cuda")}
+    try:
+        result = replay_buffer.submit_update_if_present(
+            index=index, generation=generation, patch=patch
+        ).result(timeout=5)
+        assert result.updated_count == 4
+        (seen,) = replay_buffer.seen
+        assert seen["patch"]["obs"] is patch["obs"]
+        assert torch.equal(replay_buffer[:]["obs"], patch["obs"])
+    finally:
+        replay_buffer.shutdown()
 
 
 def _release_prefetch_when_futures_lock_is_held(
@@ -1260,7 +1557,7 @@ def test_replay_buffer_prefetch_state_dict_roundtrip():
     restored.sample()
     restored.load_state_dict(state)
 
-    for _ in range(4):
+    for _ in range(source._prefetch_cap):
         _assert_prefetch_samples_equal(
             source.sample(return_info=True), restored.sample(return_info=True)
         )
@@ -1284,7 +1581,7 @@ def test_replay_buffer_prefetch_state_dict_waits_for_in_flight_samples():
 
     restored = _make_prefetch_replay_buffer(seed=1)
     restored.load_state_dict(state)
-    for _ in range(4):
+    for _ in range(source._prefetch_cap):
         _assert_prefetch_samples_equal(
             source.sample(return_info=True), restored.sample(return_info=True)
         )
@@ -1310,7 +1607,7 @@ def test_replay_buffer_load_state_dict_waits_for_in_flight_samples():
     assert not release_thread.is_alive()
     assert not release_errors
 
-    for _ in range(4):
+    for _ in range(source._prefetch_cap):
         _assert_prefetch_samples_equal(
             source.sample(return_info=True), restored.sample(return_info=True)
         )
@@ -1364,7 +1661,7 @@ def test_replay_buffer_prefetch_dumps_roundtrip(tmp_path):
     restored.sample()
     restored.loads(tmp_path)
 
-    for _ in range(4):
+    for _ in range(source._prefetch_cap):
         _assert_prefetch_samples_equal(
             source.sample(return_info=True), restored.sample(return_info=True)
         )
@@ -1376,7 +1673,7 @@ def test_replay_buffer_prefetch_pickle_roundtrip():
 
     restored = pickle.loads(pickle.dumps(source))
 
-    for _ in range(4):
+    for _ in range(source._prefetch_cap):
         _assert_prefetch_samples_equal(
             source.sample(return_info=True), restored.sample(return_info=True)
         )
@@ -1415,7 +1712,10 @@ def test_replay_buffer_prefetch_autograd_roundtrip(checkpoint, tensordict):
     assert queued_data.is_leaf
     assert queued_data.requires_grad
 
-    for _ in range(4):
+    # Only the queued batches are part of the checkpoint. Once they are
+    # consumed, independent worker pools may assign later RNG draws to futures
+    # in a different order.
+    for _ in range(source._prefetch_cap):
         expected_data, expected_info = source.sample(return_info=True)
         actual_data, actual_info = restored.sample(return_info=True)
         if tensordict:
@@ -2593,6 +2893,15 @@ class TestUpdateIfPresent:
         assert result.updated_count == 10
         assert result.stale_count == 0
         torch.testing.assert_close(rb[:]["obs"], patch["obs"])
+
+    def test_update_invalidates_derived_caches(self):
+        # Caches keyed on the storage revision (boundary caches, the
+        # fragmented trajectory index) must see conditional patches.
+        rb, _, index, generation = self._make_rb()
+        revision = rb._storage._mutation_revision
+        patch = {"obs": torch.full((10, 3), 42.0)}
+        rb.update_if_present(index=index, generation=generation, patch=patch)
+        assert rb._storage._mutation_revision > revision
 
     def test_stale_records_skipped_and_unmodified(self):
         rb, _, index, generation = self._make_rb()

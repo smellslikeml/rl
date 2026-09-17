@@ -4,13 +4,17 @@
 # LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Literal
 
+import numpy as np
 import torch
 from tensordict import TensorDictBase, unravel_key
 from tensordict.nn import (
     CompositeDistribution,
     dispatch,
+    ProbabilisticTensorDictModule,
+    ProbabilisticTensorDictSequential,
     TensorDictModule,
     TensorDictModuleBase,
     TensorDictModuleWrapper,
@@ -25,6 +29,12 @@ from torch.distributions import Categorical
 from torchrl._utils import _replace_last
 from torchrl.data.tensor_specs import Composite, TensorSpec
 from torchrl.data.utils import _process_action_space_spec
+from torchrl.modules.distributions.discrete import OneHotCategorical
+from torchrl.modules.models.model_based import (
+    _dreamer_v3_init,
+    _unimix_probs,
+    DreamerV3MLP,
+)
 from torchrl.modules.tensordict_module.common import DistributionalDQNnet, SafeModule
 from torchrl.modules.tensordict_module.probabilistic import (
     SafeProbabilisticModule,
@@ -424,6 +434,206 @@ class ProbabilisticActor(SafeProbabilisticTensorDictSequential):
         )
 
 
+class _DreamerV3DiscreteActorNet(nn.Module):
+    def __init__(
+        self, in_features, out_features, depth, num_cells, norm_eps, unimix, device
+    ):
+        super().__init__()
+        self.backbone = DreamerV3MLP(
+            in_features,
+            None,
+            depth=depth,
+            num_cells=num_cells,
+            norm_eps=norm_eps,
+            device=device,
+        )
+        self.logits_head = nn.Linear(num_cells, out_features, device=device)
+        self.logits_head.apply(_dreamer_v3_init)
+        with torch.no_grad():
+            self.logits_head.weight.mul_(0.01)
+        self.unimix = unimix
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        hidden = self.backbone(belief, state)
+        logits = self.logits_head(hidden).float()
+        return _unimix_probs(logits, self.unimix).log()
+
+
+class DreamerV3DiscreteActor(ProbabilisticTensorDictSequential):
+    """DreamerV3 one-hot categorical policy over stochastic state and belief.
+
+    The RMS-normalized SiLU network concatenates belief before state, initializes
+    its output weights with scale ``0.01``, and mixes categorical probabilities
+    with a uniform distribution. Logits remain in float32 under autocast.
+    Calling the actor writes logits, a hard one-hot action and its log probability
+    into the input tensordict. Sampling is random by default and respects
+    :func:`~torchrl.envs.set_exploration_type`. Use :meth:`get_dist` for
+    differentiable straight-through sampling with ``distribution.rsample()``.
+
+    Reference: Hafner et al., DreamerV3 (2023),
+    https://arxiv.org/abs/2301.04104.
+
+    Args:
+        in_features (int): Sum of the flattened stochastic state and belief widths.
+        out_features (int): Number of discrete actions.
+
+    Keyword Args:
+        depth (int, optional): Number of hidden layers. Must be positive.
+            Defaults to ``3``.
+        num_cells (int, optional): Width of each hidden layer. Defaults to ``1024``.
+        norm_eps (float, optional): RMS normalization epsilon. Defaults to ``1e-4``.
+        unimix (float, optional): Uniform probability fraction in ``[0, 1)``.
+            Defaults to ``0.01``.
+        in_keys (Sequence[NestedKey] or None, optional): Exactly two input keys,
+            in stochastic state, then belief order. Defaults to
+            ``["state", "belief"]`` when ``None``.
+        action_key (NestedKey, optional): Output one-hot action key. Defaults to
+            ``"action"``.
+        logits_key (NestedKey, optional): Output mixed log-probability key.
+            Defaults to ``"logits"``.
+        log_prob_key (NestedKey, optional): Output sampled-action log-probability
+            key. Defaults to ``"action_log_prob"``.
+        device (torch.device or str or None, optional): Initial parameter device.
+            Defaults to ``None``, using the default torch device.
+
+    Examples:
+        >>> import torch
+        >>> from tensordict import TensorDict
+        >>> from torchrl.envs import ExplorationType, set_exploration_type
+        >>> from torchrl.modules import DreamerV3DiscreteActor
+        >>> actor = DreamerV3DiscreteActor(12, 3, depth=2, num_cells=32)
+        >>> data = TensorDict({"state": torch.randn(4, 8), "belief": torch.randn(4, 4)}, [4])
+        >>> with set_exploration_type(ExplorationType.DETERMINISTIC):
+        ...     result = actor(data)
+        >>> result["action"].sum(-1).tolist()
+        [1, 1, 1, 1]
+        >>> distribution = actor.get_dist(data)
+        >>> action = distribution.rsample()
+        >>> (action * torch.arange(3)).sum().backward()
+        >>> distribution.log_prob(action).shape
+        torch.Size([4])
+
+    .. seealso:: :class:`~torchrl.trainers.algorithms.configs.DreamerV3DiscreteActorConfig`
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        depth: int = 3,
+        num_cells: int = 1024,
+        norm_eps: float = 1e-4,
+        unimix: float = 0.01,
+        in_keys: Sequence[NestedKey] | None = None,
+        action_key: NestedKey = "action",
+        logits_key: NestedKey = "logits",
+        log_prob_key: NestedKey = "action_log_prob",
+        device: torch.device | str | None = None,
+    ):
+        in_keys = list(in_keys) if in_keys is not None else ["state", "belief"]
+        if len(in_keys) != 2:
+            raise ValueError(
+                "in_keys must contain the state and belief keys, in that order."
+            )
+        if depth < 1:
+            raise ValueError(f"depth must be positive, got {depth}.")
+        if not 0 <= unimix < 1:
+            raise ValueError(f"unimix must be in [0, 1), got {unimix}.")
+        super().__init__(
+            TensorDictModule(
+                _DreamerV3DiscreteActorNet(
+                    in_features,
+                    out_features,
+                    depth,
+                    num_cells,
+                    norm_eps,
+                    unimix,
+                    device,
+                ),
+                in_keys=in_keys,
+                out_keys=[logits_key],
+            ),
+            ProbabilisticTensorDictModule(
+                in_keys={"logits": logits_key},
+                out_keys=[action_key],
+                distribution_class=OneHotCategorical,
+                default_interaction_type=InteractionType.RANDOM,
+                return_log_prob=True,
+                log_prob_key=log_prob_key,
+            ),
+        )
+
+
+class DreamerV3SeededPolicy(TensorDictModuleBase):
+    """Run a DreamerV3 policy with an independent, checkpointable random stream.
+
+    Each call derives a seed from the initial seed and call count, restoring the
+    caller's torch RNG state afterwards. The seed and count are included in the
+    module's ``state_dict`` alongside its parameters. Calls must be serialized;
+    Python seeding is not compatible with CUDA-graph capture of this wrapper.
+
+    Args:
+        module (TensorDictModuleBase): Policy to execute, with declared input keys.
+        seed (int): Initial non-negative seed for the policy stream.
+
+    Examples:
+        >>> import torch
+        >>> from tensordict import TensorDict
+        >>> from torchrl.modules import DreamerV3DiscreteActor, DreamerV3SeededPolicy
+        >>> actor = DreamerV3DiscreteActor(6, 3, depth=1, num_cells=8)
+        >>> policy = DreamerV3SeededPolicy(actor, seed=7)
+        >>> data = TensorDict({"state": torch.zeros(2, 4), "belief": torch.zeros(2, 2)}, [2])
+        >>> _ = policy(data.clone())
+        >>> saved = policy.state_dict()
+        >>> expected = policy(data.clone())["action"]
+        >>> _ = policy.load_state_dict(saved)
+        >>> torch.equal(policy(data.clone())["action"], expected)
+        True
+
+    .. seealso:: :class:`~torchrl.trainers.algorithms.configs.DreamerV3SeededPolicyConfig`
+    """
+
+    def __init__(self, module: TensorDictModuleBase, seed: int):
+        super().__init__()
+        self.module = module
+        self.seed = seed
+        self.counter = 0
+        self.in_keys = module.in_keys
+        self.out_keys = module.out_keys
+
+    def get_extra_state(self) -> dict[str, int]:
+        """Return the policy's seed and call count for module checkpointing."""
+        return {"seed": self.seed, "counter": self.counter}
+
+    def set_extra_state(self, state: Mapping[str, int]) -> None:
+        """Restore the next policy draw without changing the caller's RNG."""
+        self.seed = state["seed"]
+        self.counter = state["counter"]
+
+    def reset_counter(self) -> None:
+        """Restart the counter, because a setup call can move it before step 0."""
+        self.counter = 0
+
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        reference = tensordict.get("state", None)
+        if reference is None:
+            reference = tensordict.get(self.in_keys[0])
+        device = reference.device
+        devices = [device] if device.type != "cpu" else []
+        with torch.random.fork_rng(devices=devices, device_type=device.type):
+            rng = np.random.default_rng(seed=[self.seed, self.counter, 0])
+            words = rng.integers(0, np.iinfo(np.uint32).max, (2,), np.uint32)
+            seed = (int(words[0]) << 32) | int(words[1])
+            torch.random.default_generator.manual_seed(seed)
+            if devices:
+                getattr(torch, device.type).set_rng_state(
+                    torch.Generator(device=device).manual_seed(seed).get_state(), device
+                )
+            self.counter += 1
+            return self.module(tensordict)
+
+
 class ValueOperator(TensorDictModule):
     """General class for value functions in RL.
 
@@ -529,6 +739,11 @@ class QValueModule(TensorDictModuleBase):
             If this value is out of bounds, it is projected back onto the
             desired space using the :obj:`TensorSpec.project`
             method. Default is ``False``.
+        strict_shape (bool or "auto", optional): Controls action-shape validation
+            against ``spec``. ``True`` raises on a mismatch, ``"auto"`` attempts
+            to reshape the action, and ``False`` disables validation. ``None`` is
+            accepted for compatibility and behaves like ``True``. Defaults to
+            ``True``.
 
     Returns:
         if the input is a single tensor, a triplet containing the chosen action,
@@ -570,7 +785,7 @@ class QValueModule(TensorDictModuleBase):
         var_nums: int | None = None,
         spec: TensorSpec | None = None,
         safe: bool = False,
-        strict_shape: bool | str | None = None,
+        strict_shape: bool | Literal["auto"] | None = True,
     ):
         if isinstance(action_space, TensorSpec):
             raise TypeError("Using specs in action_space is deprecated")
@@ -661,13 +876,18 @@ class QValueModule(TensorDictModuleBase):
             else None
         )
         if action_spec is not None and self.strict_shape is not False:
-            composite_batch_ndim = len(self.spec.shape)
+            action_key = unravel_key(action_key)
+            if isinstance(action_key, tuple):
+                action_spec_parent = self.spec[action_key[:-1]]
+            else:
+                action_spec_parent = self.spec
+            composite_batch_ndim = len(action_spec_parent.shape)
             per_sample_shape = action_spec.shape[composite_batch_ndim:]
             batch_shape = action_values.shape[:-1]
             target_shape = torch.Size(list(batch_shape) + list(per_sample_shape))
 
             if action.shape != target_shape:
-                if self.strict_shape is True:
+                if self.strict_shape is True or self.strict_shape is None:
                     raise RuntimeError(
                         f"Action shape {action.shape} does not match expected shape {target_shape} "
                         f"(per-sample spec shape: {per_sample_shape}). "
@@ -680,19 +900,6 @@ class QValueModule(TensorDictModuleBase):
                         raise RuntimeError(
                             f"Cannot reshape action from {action.shape} to {target_shape}."
                         )
-                elif self.strict_shape is None:
-                    import warnings
-
-                    warnings.warn(
-                        f"Action shape {action.shape} does not match expected shape {target_shape} "
-                        f"(per-sample spec shape: {per_sample_shape}). "
-                        f"In v0.14, this will raise an error. "
-                        f"Set strict_shape='auto' to automatically reshape, "
-                        f"strict_shape=True to raise immediately, "
-                        f"or strict_shape=False to silence this warning.",
-                        FutureWarning,
-                        stacklevel=2,
-                    )
 
         tensordict.update(
             dict(zip(self.out_keys, (action, action_values, chosen_action_value)))
@@ -1149,6 +1356,11 @@ class QValueActor(SafeSequential):
             the selected action value. Defaults to ``"chosen_action_value"``.
         action_mask_key (str or tuple of str, optional): The input key
             representing the action mask. Defaults to ``"None"`` (equivalent to no masking).
+        strict_shape (bool or "auto", optional): Controls action-shape validation
+            against ``spec``. ``True`` raises on a mismatch, ``"auto"`` attempts
+            to reshape the action, and ``False`` disables validation. ``None`` is
+            accepted for compatibility and behaves like ``True``. Defaults to
+            ``True``.
 
     .. note::
         ``out_keys`` cannot be passed. If the module is a :class:`tensordict.nn.TensorDictModule`
@@ -1209,7 +1421,7 @@ class QValueActor(SafeSequential):
         action_key: NestedKey | None = None,
         chosen_action_value_key: NestedKey | None = None,
         action_mask_key: NestedKey | None = None,
-        strict_shape: bool | str | None = None,
+        strict_shape: bool | Literal["auto"] | None = True,
     ):
         if isinstance(action_space, TensorSpec):
             raise RuntimeError(

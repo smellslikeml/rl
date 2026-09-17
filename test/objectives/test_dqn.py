@@ -301,6 +301,44 @@ class TestDQN(LossModuleTestBase):
             p.data += torch.randn_like(p)
         assert all((p1 != p2).all() for p1, p2 in zip(parameters, actor.parameters()))
 
+    def test_dqn_tdlambda_uses_greedy_next_action_value(self):
+        value_network = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            value_network.weight.copy_(torch.eye(2))
+        action_spec = OneHot(2)
+        actor = QValueActor(
+            value_network,
+            in_keys=["observation"],
+            spec=action_spec,
+            action_space="one-hot",
+        )
+        loss_fn = DQNLoss(actor, action_space=action_spec, delay_value=False)
+        loss_fn.make_value_estimator(ValueEstimators.TDLambda, gamma=1.0, lmbda=0.5)
+        td = TensorDict(
+            {
+                "observation": torch.zeros(1, 2, 2),
+                # The behavior action is deliberately non-greedy at both steps.
+                "action": torch.tensor([[[1, 0], [1, 0]]]),
+                "next": {
+                    "observation": torch.tensor([[[1.0, 4.0], [2.0, 8.0]]]),
+                    "reward": torch.tensor([[[0.0], [3.0]]]),
+                    "done": torch.tensor([[[False], [True]]]),
+                    "terminated": torch.tensor([[[False], [True]]]),
+                },
+            },
+            batch_size=[1, 2],
+            names=[None, "time"],
+        )
+
+        target = loss_fn.value_estimator.value_estimate(
+            td, target_params=loss_fn.target_value_network_params
+        )
+
+        greedy_target = torch.tensor([[[3.5], [3.0]]])
+        behavior_action_target = torch.tensor([[[2.0], [3.0]]])
+        torch.testing.assert_close(target, greedy_target)
+        assert not torch.allclose(target, behavior_action_target)
+
     @pytest.mark.parametrize("delay_value", (False, True))
     @pytest.mark.parametrize("device", get_default_devices())
     @pytest.mark.parametrize("action_spec_type", ("one_hot", "categorical"))
@@ -526,6 +564,49 @@ class TestDQN(LossModuleTestBase):
         for p in loss_fn.parameters():
             p.data += torch.randn_like(p)
         assert all((p1 != p2).all() for p1, p2 in zip(parameters, actor.parameters()))
+
+    @pytest.mark.parametrize("actor_first", [False, True])
+    def test_distributional_dqn_lazy_target(self, actor_first):
+        torch.manual_seed(self.seed)
+        atoms = 3
+        action_dim = 2
+        actor = DistributionalQValueActor(
+            module=MLP(out_features=(atoms, action_dim), depth=2),
+            spec=OneHot(action_dim),
+            support=torch.arange(atoms),
+        )
+        loss_fn = DistributionalDQNLoss(actor, gamma=0.99, delay_value=True)
+        updater = SoftUpdate(loss_fn, eps=0.5)
+        td = self._create_mock_data_dqn(
+            action_spec_type="one_hot",
+            batch=5,
+            obs_dim=4,
+            action_dim=action_dim,
+            atoms=atoms,
+        )
+
+        if actor_first:
+            actor(td)
+            updater.step()
+        assert torch.isfinite(loss_fn(td)["loss"])
+
+        source_params = loss_fn.value_network_params
+        target_params = loss_fn.target_value_network_params
+        for key, source in source_params.items(True, True):
+            target = target_params.get(key)
+            torch.testing.assert_close(target, source)
+            assert not target.is_set_to(source.data)
+
+        key, source = next(
+            (key, source)
+            for key, source in source_params.items(True, True)
+            if source.requires_grad
+        )
+        target = target_params.get(key)
+        expected = target + 0.5
+        source.data.add_(1)
+        updater.step()
+        torch.testing.assert_close(target, expected)
 
     @pytest.mark.parametrize("observation_key", ["observation", "observation2"])
     @pytest.mark.parametrize("reward_key", ["reward", "reward2"])
@@ -771,6 +852,26 @@ class TestDQN(LossModuleTestBase):
         loss_elements = loss_fn_no_reduction(sample2)["loss"]
         manual_weighted_loss = (loss_elements * weights2).sum() / weights2.sum()
         assert torch.allclose(loss_out2["loss"], manual_weighted_loss, rtol=1e-4)
+
+    @pytest.mark.parametrize("action_spec_type", ("one_hot", "categorical"))
+    def test_load_lazy_estimator(self, action_spec_type):
+        # A loss saved after its value estimator was created must restore into
+        # a fresh loss whose estimator has not been built yet (trainer resume).
+        torch.manual_seed(0)
+        actor = self._create_mock_actor(action_spec_type=action_spec_type)
+        loss_fn = DQNLoss(actor, action_space=action_spec_type)
+        loss_fn.make_value_estimator(gamma=0.9)
+        state = loss_fn.state_dict()
+        assert "_value_estimator.gamma" in state
+
+        fresh = DQNLoss(
+            self._create_mock_actor(action_spec_type=action_spec_type),
+            action_space=action_spec_type,
+        )
+        assert fresh._value_estimator is None
+        fresh.load_state_dict(state)
+        assert fresh.value_estimator.gamma.item() == pytest.approx(0.9)
+        assert set(fresh.state_dict()) == set(state)
 
 
 class TestQMixer(LossModuleTestBase):

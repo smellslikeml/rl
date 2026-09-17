@@ -8,10 +8,10 @@ from __future__ import annotations
 import abc
 import functools
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from tensordict import is_tensor_collection, NestedKey, TensorDict, TensorDictBase
@@ -585,6 +585,11 @@ class LossModule(TensorDictModuleBase, metaclass=_LossMeta):
                 ),
                 no_convert=True,
             )
+            target_params.uninitialized_keys = {
+                key
+                for key, value in params.items(True, True)
+                if torch.nn.parameter.is_lazy(value)
+            }
             setattr(self, name_params_target + "_params", target_params)
         self._has_update_associated[module_name] = not create_target_params
 
@@ -601,6 +606,15 @@ class LossModule(TensorDictModuleBase, metaclass=_LossMeta):
     def __getattr__(self, item):
         if item.startswith("target_") and item.endswith("_params"):
             params = self._modules.get(item, None)
+            if params is not None:
+                pending_keys = getattr(params, "uninitialized_keys", None)
+                if pending_keys:
+                    source_params = getattr(self, item[7:])
+                    for key in pending_keys.copy():
+                        source = source_params.get(key)
+                        if not torch.nn.parameter.is_lazy(source):
+                            params.get(key).data = source.data.clone()
+                            pending_keys.remove(key)
             if params is None:
                 # no target param, take detached data
                 params = getattr(self, item[7:])
@@ -704,6 +718,21 @@ class LossModule(TensorDictModuleBase, metaclass=_LossMeta):
     @value_estimator.setter
     def value_estimator(self, value):
         self._value_estimator = value
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], *args, **kwargs):
+        """Load a state dict, building the default value estimator first when the state carries one.
+
+        The value estimator is created on first use, so a loss saved after its
+        first forward pass holds ``_value_estimator.*`` entries that a freshly
+        constructed loss has no target for. Losses configured with a
+        non-default estimator must call :meth:`make_value_estimator` before
+        loading, as they would before training.
+        """
+        if self._value_estimator is None and any(
+            str(key).startswith("_value_estimator.") for key in state_dict
+        ):
+            self._default_value_estimator()
+        return super().load_state_dict(state_dict, *args, **kwargs)
 
     def _default_value_estimator(self):
         """A value-function constructor when none is provided.

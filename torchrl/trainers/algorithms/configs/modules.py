@@ -14,7 +14,9 @@ from omegaconf import MISSING
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.modules import (
     AdditiveGaussianModule,
+    DreamerV3DiscreteActor,
     QValueActor,
+    RSSMStateEstimatorV3,
     TanhModule,
     ValueOperator,
 )
@@ -110,6 +112,177 @@ class MLPConfig(NetworkConfig):
             )
         if isinstance(self.layer_class, str):
             self.layer_class = LayerConfig(_target_=self.layer_class, _partial_=True)
+
+
+@dataclass
+class DreamerV3MLPConfig(NetworkConfig):
+    """A class to configure a DreamerV3 multilayer perceptron.
+
+    Example:
+        >>> import torch
+        >>> from hydra.utils import instantiate
+        >>> from torchrl.trainers.algorithms.configs import DreamerV3MLPConfig
+        >>> cfg = DreamerV3MLPConfig(
+        ...     in_features=6, out_features=4, depth=2, num_cells=8
+        ... )
+        >>> net = instantiate(cfg)
+        >>> y = net(torch.randn(3, 2), torch.randn(3, 4))
+        >>> assert y.shape == (3, 4)
+
+    .. seealso:: :class:`~torchrl.modules.DreamerV3MLP`
+    """
+
+    in_features: int = MISSING
+    out_features: int | None = MISSING
+    depth: int = 3
+    num_cells: int = 1024
+    outscale: float = 1.0
+    norm_eps: float = 1e-4
+    device: Any = None
+    _target_: str = "torchrl.modules.DreamerV3MLP"
+
+
+@dataclass
+class DreamerV3ImageEncoderConfig(NetworkConfig):
+    """Hydra configuration for :class:`~torchrl.modules.DreamerV3ImageEncoder`.
+
+    Example:
+        >>> import torch
+        >>> from hydra.utils import instantiate
+        >>> from torchrl.trainers.algorithms.configs import DreamerV3ImageEncoderConfig
+        >>> cfg = DreamerV3ImageEncoderConfig(depth=8, mults=[1, 2])
+        >>> net = instantiate(cfg)
+        >>> image = torch.randint(0, 256, (4, 3, 16, 16), dtype=torch.uint8)
+        >>> assert net(image).shape == (4, 256)
+
+    .. seealso:: :class:`~torchrl.modules.DreamerV3ImageEncoder`
+    """
+
+    in_channels: int = 3
+    depth: int = 64
+    mults: list[int] = field(default_factory=partial(list, (2, 3, 4, 4)))
+    kernel_size: int = 5
+    norm_eps: float = 1e-4
+    device: Any = None
+    _target_: str = "torchrl.modules.DreamerV3ImageEncoder"
+
+
+@dataclass
+class DreamerV3ImageDecoderConfig(NetworkConfig):
+    """Hydra configuration for :class:`~torchrl.modules.DreamerV3ImageDecoder`.
+
+    Example:
+        >>> import torch
+        >>> from hydra.utils import instantiate
+        >>> from torchrl.trainers.algorithms.configs import DreamerV3ImageDecoderConfig
+        >>> cfg = DreamerV3ImageDecoderConfig(
+        ...     in_features=12, image_shape=[3, 16, 16], depth=8, mults=[1, 2], num_blocks=2
+        ... )
+        >>> net = instantiate(cfg)
+        >>> assert net(torch.randn(4, 12)).shape == (4, 3, 16, 16)
+
+    .. seealso:: :class:`~torchrl.modules.DreamerV3ImageDecoder`
+    """
+
+    in_features: int = MISSING
+    image_shape: list[int] = field(default_factory=partial(list, (3, 64, 64)))
+    depth: int = 64
+    mults: list[int] = field(default_factory=partial(list, (2, 3, 4, 4)))
+    kernel_size: int = 5
+    num_blocks: int = 8
+    norm_eps: float = 1e-4
+    device: Any = None
+    _target_: str = "torchrl.modules.DreamerV3ImageDecoder"
+
+
+@dataclass
+class DreamerV3DiscreteActorConfig(NetworkConfig):
+    """Hydra configuration for :class:`~torchrl.modules.DreamerV3DiscreteActor`.
+
+    Examples:
+        >>> import torch
+        >>> from hydra.utils import instantiate
+        >>> from tensordict import TensorDict
+        >>> from torchrl.trainers.algorithms.configs import DreamerV3DiscreteActorConfig
+        >>> actor = instantiate(DreamerV3DiscreteActorConfig(in_features=12, out_features=3))
+        >>> data = TensorDict({"state": torch.randn(4, 8), "belief": torch.randn(4, 4)}, [4])
+        >>> actor(data)["action"].shape
+        torch.Size([4, 3])
+    """
+
+    in_features: int = MISSING
+    out_features: int = MISSING
+    depth: int = 3
+    num_cells: int = 1024
+    norm_eps: float = 1e-4
+    unimix: float = 0.01
+    in_keys: Any = None
+    action_key: Any = "action"
+    logits_key: Any = "logits"
+    log_prob_key: Any = "action_log_prob"
+    device: Any = None
+    _target_: str = (
+        "torchrl.trainers.algorithms.configs.modules._make_dreamer_v3_discrete_actor"
+    )
+
+
+def _make_dreamer_v3_discrete_actor(**kwargs) -> DreamerV3DiscreteActor:
+    """Normalize Hydra's nested key lists before constructing the actor."""
+    in_keys = _normalize_hydra_keys(kwargs.pop("in_keys", None))
+    for key in ("action_key", "logits_key", "log_prob_key"):
+        if key in kwargs:
+            kwargs[key] = _normalize_hydra_key(kwargs[key])
+    return DreamerV3DiscreteActor(in_keys=in_keys, **kwargs)
+
+
+@dataclass
+class DreamerV3SeededPolicyConfig(NetworkConfig):
+    """Hydra configuration for :class:`~torchrl.modules.DreamerV3SeededPolicy`.
+
+    Examples:
+        >>> from hydra.utils import instantiate
+        >>> from torchrl.trainers.algorithms.configs import DreamerV3DiscreteActorConfig, DreamerV3SeededPolicyConfig
+        >>> config = DreamerV3SeededPolicyConfig(
+        ...     module=DreamerV3DiscreteActorConfig(in_features=6, out_features=3), seed=7,
+        ... )
+        >>> policy = instantiate(config)
+        >>> policy.get_extra_state()
+        {'seed': 7, 'counter': 0}
+    """
+
+    module: Any = MISSING
+    seed: int = MISSING
+    _target_: str = "torchrl.modules.DreamerV3SeededPolicy"
+
+
+@dataclass
+class RSSMStateEstimatorV3Config(NetworkConfig):
+    """Hydra configuration for :class:`~torchrl.modules.RSSMStateEstimatorV3`.
+
+    Examples:
+        Given the shared prior and posterior in the estimator's example:
+
+        >>> from hydra.utils import instantiate
+        >>> from torchrl.trainers.algorithms.configs import RSSMStateEstimatorV3Config
+        >>> estimator = instantiate(  # doctest: +SKIP
+        ...     RSSMStateEstimatorV3Config(), prior=prior, posterior=posterior,
+        ... )
+    """
+
+    prior: Any = MISSING
+    posterior: Any = MISSING
+    in_keys: Any = None
+    out_keys: Any = None
+    _target_: str = (
+        "torchrl.trainers.algorithms.configs.modules._make_rssm_state_estimator_v3"
+    )
+
+
+def _make_rssm_state_estimator_v3(**kwargs) -> RSSMStateEstimatorV3:
+    """Normalize configured nested keys before constructing the estimator."""
+    in_keys = _normalize_hydra_keys(kwargs.pop("in_keys", None))
+    out_keys = _normalize_hydra_keys(kwargs.pop("out_keys", None))
+    return RSSMStateEstimatorV3(in_keys=in_keys, out_keys=out_keys, **kwargs)
 
 
 @dataclass
@@ -313,6 +486,16 @@ class TanhNormalModelConfig(ModelConfig):
         >>> y = net(torch.randn(1, 10))
         >>> assert y.shape == (1, 5)
 
+    Args:
+        low: lower bound of the action support handed to
+            :class:`~torchrl.modules.TanhNormal` (a scalar or a per-dimension
+            sequence). Defaults to ``None``, i.e. the distribution default of ``-1``.
+        high: upper bound of the action support. Defaults to ``None``, i.e. ``1``.
+        tanh_loc: if ``True``, the location is squashed to ``[-upscale, upscale]``
+            before the tanh transform, which keeps the log-probability of actions
+            at the bounds finite (see :class:`~torchrl.modules.TanhNormal`).
+            Defaults to ``False``.
+
     .. seealso:: :class:`torchrl.modules.TanhNormal`
     """
 
@@ -322,6 +505,9 @@ class TanhNormalModelConfig(ModelConfig):
     extract_normal_params: bool = True
     scale_mapping: str = "biased_softplus_1.0"
     scale_lb: float = 1e-4
+    low: Any = None
+    high: Any = None
+    tanh_loc: bool = False
 
     param_keys: Any = None
 
@@ -517,6 +703,19 @@ def _make_tanh_normal_model(*args, **kwargs):
     eval_mode = kwargs.pop("eval_mode", False)
     exploration_type = kwargs.pop("exploration_type", "RANDOM")
     shared = kwargs.pop("shared", False)
+    distribution_kwargs = dict(kwargs.pop("distribution_kwargs", None) or {})
+    for bound in ("low", "high"):
+        value = kwargs.pop(bound, None)
+        if value is None:
+            continue
+        # omegaconf hands sequences over as ListConfig
+        if not isinstance(value, (int, float)):
+            value = torch.as_tensor(list(value), dtype=torch.get_default_dtype())
+        distribution_kwargs[bound] = value
+    if kwargs.pop("tanh_loc", False):
+        distribution_kwargs["tanh_loc"] = True
+    if distribution_kwargs:
+        kwargs["distribution_kwargs"] = distribution_kwargs
 
     # Now instantiate the network
     if hasattr(network, "_target_"):

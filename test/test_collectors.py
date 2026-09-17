@@ -67,6 +67,7 @@ from torchrl.collectors.distributed.ray import _has_ray, RayCollector
 from torchrl.collectors.distributed.rpc import RPCCollector
 
 from torchrl.collectors.utils import (
+    _device_shareable_across_processes,
     _make_policy_factory,
     _maybe_normalize_replay_buffer_tensordict_device,
     _traj_chunk_ends_done,
@@ -193,6 +194,119 @@ def test_weight_sync_scheme_from_backend_rejects_unknown():
         WeightSyncScheme.from_backend("unknown")
 
 
+class TestWeightSyncCPUStaging:
+    """Weights on devices without cross-process sharing support (CUDA on
+    Windows/WSL2, MPS anywhere) must be staged through CPU shared memory,
+    otherwise they are silently received as zeros and can corrupt the
+    sender's memory (https://github.com/pytorch/rl/issues/3985)."""
+
+    def test_cpu_and_meta_always_shareable(self):
+        assert _device_shareable_across_processes(torch.device("cpu"))
+        assert _device_shareable_across_processes(torch.device("meta"))
+
+    def test_mps_never_shareable(self):
+        assert not _device_shareable_across_processes(torch.device("mps"))
+
+    @pytest.mark.parametrize(
+        "scheme_cls", [SharedMemWeightSyncScheme, MultiProcessWeightSyncScheme]
+    )
+    def test_params_map_stages_cuda_weights_without_ipc(self, monkeypatch, scheme_cls):
+        import torchrl.collectors.utils as collector_utils
+
+        monkeypatch.setattr(
+            collector_utils, "_platform_supports_cuda_ipc", lambda: False
+        )
+        model = nn.Linear(2, 1)
+        scheme = scheme_cls()
+        with pytest.warns(UserWarning, match="staged through CPU shared memory"):
+            params_map = scheme._get_params_map(
+                model=model,
+                devices=[torch.device("cuda:0"), torch.device("cuda:0")],
+            )
+        assert params_map[0] is params_map[1]
+        for weights in params_map.values():
+            assert weights.is_shared()
+            for tensor in weights.values(True, True):
+                assert tensor.device.type == "cpu"
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_params_map_keeps_cuda_weights_with_ipc(self, monkeypatch):
+        import torchrl.collectors.utils as collector_utils
+
+        monkeypatch.setattr(
+            collector_utils, "_platform_supports_cuda_ipc", lambda: True
+        )
+        model = nn.Linear(2, 1)
+        scheme = SharedMemWeightSyncScheme()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            params_map = scheme._get_params_map(
+                model=model, devices=[torch.device("cuda:0")]
+            )
+        for tensor in params_map[0].values(True, True):
+            assert tensor.device.type == "cuda"
+
+    def test_params_map_cpu_weights_unchanged(self):
+        model = nn.Linear(2, 1)
+        scheme = SharedMemWeightSyncScheme()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            params_map = scheme._get_params_map(
+                model=model, devices=[torch.device("cpu")]
+            )
+        for tensor in params_map[0].values(True, True):
+            assert tensor.device.type == "cpu"
+
+    def _run_staged_multicollector(self, device):
+        """Collect on a device without cross-process sharing support and assert
+        the #3985 regression stays fixed: the parent policy is not mutated and
+        the workers act with the parent's weights (a worker that received zero
+        or garbage weights would emit near-zero actions instead of ~bias)."""
+        env_maker = ContinuousActionVecMockEnv
+        policy = TensorDictModule(
+            nn.LazyLinear(7), in_keys=["observation"], out_keys=["action"]
+        )
+        env = env_maker()
+        policy(env.reset())
+        with torch.no_grad():
+            policy.module.bias.fill_(1000.0)
+        policy = policy.to(device)
+        weights_before = TensorDict.from_module(policy).data.cpu().clone()
+        with pytest.warns(UserWarning, match="staged through CPU shared memory"):
+            collector = MultiSyncCollector(
+                [env_maker, env_maker],
+                policy=policy,
+                frames_per_batch=16,
+                total_frames=32,
+                policy_device=device,
+                storing_device="cpu",
+                env_device="cpu",
+            )
+        try:
+            for data in collector:
+                assert data.numel() == 16
+                assert (data["action"] > 500.0).all()
+                break
+            weights_after = TensorDict.from_module(policy).data
+            assert_allclose_td(weights_before, weights_after.cpu())
+        finally:
+            collector.shutdown()
+            del collector
+
+    @pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason="needs an MPS device"
+    )
+    def test_multicollector_mps_policy(self):
+        self._run_staged_multicollector(torch.device("mps"))
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(sys.platform != "win32", reason="needs Windows")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_multicollector_windows_cuda_policy(self):
+        self._run_staged_multicollector(torch.device("cuda:0"))
+
+
 def test_ray_weight_sync_copy_preserves_config_and_resets_runtime():
     with pytest.warns(UserWarning, match="state_dict strategy is experimental"):
         scheme = RayWeightSyncScheme(strategy="state_dict", backend="nccl")
@@ -284,6 +398,17 @@ class ParametricPolicy(Actor):
         super().__init__(
             ParametricPolicyNet(),
             in_keys=["observation"],
+        )
+
+
+class MockRandomPolicy(torch.nn.Module):
+    def __init__(self, action_dim):
+        super().__init__()
+        self.action_dim = action_dim
+
+    def forward(self, observation):
+        return torch.randn(
+            *observation.shape[:-1], self.action_dim, device=observation.device
         )
 
 
@@ -2330,6 +2455,57 @@ if __name__ == "__main__":
 
         assert_allclose_td(data1, data20)
         assert_allclose_td(data10, data20)
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires cuda")
+    @pytest.mark.skipif(
+        IS_WINDOWS, reason="torch.compile not fully supported on windows"
+    )
+    def test_cudagraph_policy_stochastic_diversity(self):
+        try:
+            from torch.compiler import cudagraph_mark_step_begin
+
+            _ = cudagraph_mark_step_begin
+        except ImportError:
+            pytest.skip(
+                "cudagraph_mark_step_begin not available in this PyTorch version."
+            )
+
+        def create_env():
+            return ContinuousActionVecMockEnv(device="cuda:0")
+
+        env = create_env()
+        n_actions = env.action_spec.shape[-1]
+
+        policy = TensorDictModule(
+            MockRandomPolicy(n_actions), in_keys=["observation"], out_keys=["action"]
+        )
+
+        collector = Collector(
+            create_env_fn=create_env,
+            policy=policy,
+            total_frames=20,
+            frames_per_batch=20,
+            device="cuda:0",
+            storing_device="cuda:0",
+            cudagraph_policy=True,
+            compile_policy={"mode": "default", "fullgraph": False},
+        )
+
+        actions = None
+        try:
+            for data in collector:
+                actions = data["action"]
+                break
+        finally:
+            collector.shutdown()
+
+        assert actions is not None, "Collector yielded no data"
+        # If RNG is frozen by cudagraph, standard deviation will be exactly 0 across steps
+        std = actions.std(dim=0).mean().item()
+        assert (
+            std > 0.1
+        ), f"Actions have abnormally low variance (std={std}). cudagraph RNG state might be frozen."
 
     @pytest.mark.parametrize("use_async", [False, True])
     @pytest.mark.parametrize(
@@ -5475,6 +5651,33 @@ class TestCollectHooks:
             assert total_frames == 64
         finally:
             collector.shutdown()
+
+    def test_post_collect_hook_runs_before_replay_write(self):
+        hook_calls = 0
+
+        def hook(result):
+            nonlocal hook_calls
+            hook_calls += 1
+            result.set("hook_marker", torch.ones(result.batch_size, dtype=torch.bool))
+
+        env = ContinuousActionVecMockEnv()
+        rb = ReplayBuffer(storage=LazyTensorStorage(64, device="cpu"))
+        collector = Collector(
+            env,
+            RandomPolicy(env.action_spec),
+            frames_per_batch=16,
+            total_frames=32,
+            replay_buffer=rb,
+            post_collect_hook=hook,
+        )
+        try:
+            outputs = list(collector)
+        finally:
+            collector.shutdown()
+
+        assert outputs == [None, None]
+        assert hook_calls == 2
+        assert rb[:]["hook_marker"].all()
 
     def test_hooks_none_by_default(self):
         collector = Collector(

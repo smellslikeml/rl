@@ -15,7 +15,6 @@ import torch
 
 from tensordict import lazy_stack, MetaData, TensorDict
 from tensordict.nn import TensorDictModule
-from torchrl._utils import logger
 from torchrl.data import History, LazyStackStorage, ReplayBuffer
 from torchrl.data.llm.history import _CHAT_TEMPLATES
 from torchrl.envs.llm.transforms.kl import RetrieveLogProb
@@ -29,7 +28,6 @@ from torchrl.objectives.llm.distillation import (
 )
 from torchrl.objectives.llm.grpo import (
     CISPOLoss,
-    CISPOLossOutput,
     GRPOLoss,
     GRPOLossOutput,
     MCAdvantage,
@@ -50,6 +48,11 @@ prompts = [
     "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore",
     "eu fugiat nulla pariatur.",
 ]
+
+
+class _NormalWithNonfiniteEntropy(torch.distributions.Normal):
+    def entropy(self):
+        return torch.full_like(self.loc, float("nan"))
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -662,7 +665,51 @@ def _mock_data_grpo(vocab_size: int, device: torch.device | str = "cpu") -> Tens
     return data
 
 
+class _FixedLogProbDistribution:
+    def __init__(self, log_prob, mask):
+        self.log_prob_value = log_prob
+        self.mask = mask
+
+    def log_prob(self, value):
+        return self.log_prob_value
+
+
+class _FixedLogProbPolicy(torch.nn.Module):
+    in_keys = ()
+
+    def get_dist(self, tensordict, **kwargs):
+        return _FixedLogProbDistribution(
+            tensordict["current_log_prob"], tensordict["mask"]
+        )
+
+
+def _policy_loss_data(current_log_prob, sample_log_prob, advantage):
+    current_log_prob = torch.tensor([current_log_prob], dtype=torch.float32)
+    sample_log_prob = torch.tensor([sample_log_prob], dtype=torch.float32)
+    advantage = torch.tensor([advantage], dtype=torch.float32).unsqueeze(-1)
+    return TensorDict(
+        {
+            "current_log_prob": current_log_prob,
+            "mask": torch.ones_like(current_log_prob, dtype=torch.bool),
+            ("tokens", "full"): torch.zeros_like(current_log_prob, dtype=torch.long),
+            ("log_probs", "full"): sample_log_prob,
+            "advantage": advantage,
+        },
+        batch_size=[1],
+    )
+
+
 class TestLosses:
+    def test_grpo_entropy_mc_when_analytic_is_nonfinite(self):
+        loss_fn = GRPOLoss(actor_network=None)
+        loc = torch.zeros(3, 4)
+        dist = _NormalWithNonfiniteEntropy(loc, torch.ones_like(loc))
+
+        entropy = loss_fn._get_entropy(dist, adv_shape=loc.shape)
+
+        assert torch.isfinite(entropy).all()
+        assert entropy.shape == (3, 4, 1)
+
     def test_grpo_token_mean_expands_token_mask(self):
         """Test token_mean aggregation with per-token values and masks."""
         loss_fn = GRPOLoss(actor_network=None, aggregation="token_mean")
@@ -677,17 +724,10 @@ class TestLosses:
         expected = value[expected_mask].mean()
         torch.testing.assert_close(result, expected)
 
-    @pytest.mark.parametrize("dapo", [True, False], ids=["dapo", "symmetric"])
-    def test_grpo(self, mock_transformer_model, dapo):
+    def test_grpo(self, mock_transformer_model):
         """Test GRPO loss computation with mock models."""
         vocab_size = 1024
         device = torch.device("cpu")
-        if dapo:
-            eps_low = 0.20
-            eps_high = 0.28
-            eps = (eps_low, eps_high)
-        else:
-            eps = 0.20
         # Create mock model and wrap it
         model = mock_transformer_model(vocab_size=vocab_size, device=device)
         actor_network = TransformersWrapper(
@@ -698,7 +738,7 @@ class TestLosses:
         )
 
         # Create loss module
-        loss_fn = GRPOLoss(actor_network, clip_epsilon=eps)
+        loss_fn = GRPOLoss(actor_network, clip_epsilon=0.2)
 
         # Create fake data
         data = _mock_data_grpo(vocab_size=vocab_size, device=device)
@@ -743,73 +783,35 @@ class TestLosses:
             0 <= loss_vals.clip_fraction <= 1
         ), f"clip_fraction out of range: {loss_vals.clip_fraction}"
 
-    def test_kl_mask_threshold(self, mock_transformer_model):
-        """Test that kl_mask_threshold properly filters out high-KL tokens."""
-        torch.manual_seed(42)
-        vocab_size = 1024
-        device = (
-            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    def test_grpo_asymmetric_clipping(self):
+        data = _policy_loss_data(
+            current_log_prob=[torch.log(torch.tensor(1.25))],
+            sample_log_prob=[0.0],
+            advantage=[1.0],
         )
+        loss = GRPOLoss(
+            _FixedLogProbPolicy(),
+            clip_epsilon=(0.20, 0.28),
+            entropy_bonus=False,
+        )(data)
 
-        # Create mock model and wrap it
-        model = mock_transformer_model(vocab_size=vocab_size, device=device)
-        actor_network = TransformersWrapper(
-            model,
-            generate=False,
-            pad_output=True,
-            input_mode="history",
+        torch.testing.assert_close(loss.loss_objective, torch.tensor(-1.25))
+        torch.testing.assert_close(loss.clip_fraction, torch.tensor(0.0))
+
+    def test_kl_mask_threshold(self):
+        data = _policy_loss_data(
+            current_log_prob=[0.0, 1.0],
+            sample_log_prob=[0.0, 0.0],
+            advantage=[2.0, 10.0],
         )
+        loss = GRPOLoss(
+            _FixedLogProbPolicy(),
+            clip_epsilon=(0.9, 2.0),
+            kl_mask_threshold=0.125,
+            entropy_bonus=False,
+        )(data)
 
-        # Create fake data
-        data = _mock_data_grpo(vocab_size=vocab_size, device=device)
-
-        # First, test that the data works without any threshold
-        loss_fn_baseline = GRPOLoss(
-            actor_network, clip_epsilon=0.2, kl_mask_threshold=None
-        )
-
-        data_baseline = data.clone()
-        loss_baseline = loss_fn_baseline(data_baseline)
-        logger.info(f"Baseline loss (no threshold): {loss_baseline.loss_objective}")
-        logger.info(f"Baseline ESS: {loss_baseline.ESS}")
-
-        # Check baseline is valid
-        if not torch.isfinite(loss_baseline.loss_objective):
-            raise ValueError(
-                f"Baseline loss is not finite: {loss_baseline.loss_objective}, skipping test"
-            )
-
-        # Now test with kl_mask_threshold enabled
-        # Use a very high threshold that should not mask any tokens
-        kl_threshold = 100.0  # Extremely high threshold to ensure no masking
-        loss_fn_with_threshold = GRPOLoss(
-            actor_network, clip_epsilon=0.2, kl_mask_threshold=kl_threshold
-        )
-
-        data_with_threshold = data.clone()
-        loss_with_threshold = loss_fn_with_threshold(data_with_threshold)
-
-        # Should produce valid output
-        assert isinstance(loss_with_threshold, GRPOLossOutput)
-
-        # Check that the loss is finite (with such a high threshold, it should be)
-        assert torch.isfinite(
-            loss_with_threshold.loss_objective
-        ), f"loss_with_threshold is not finite: {loss_with_threshold.loss_objective}"
-        assert torch.isfinite(
-            loss_with_threshold.ESS
-        ), f"ESS with threshold is not finite: {loss_with_threshold.ESS}"
-
-        logger.info(
-            f"Loss with high threshold (100.0): {loss_with_threshold.loss_objective}"
-        )
-        logger.info(f"ESS with high threshold: {loss_with_threshold.ESS}")
-
-        # The losses should be identical or very similar since we're not masking anything
-        # (the difference comes only from numerical precision)
-        assert torch.isclose(
-            loss_baseline.loss_objective, loss_with_threshold.loss_objective, rtol=1e-3
-        ), f"Losses differ too much with high threshold: {loss_baseline.loss_objective} vs {loss_with_threshold.loss_objective}"
+        torch.testing.assert_close(loss.loss_objective, torch.tensor(-2.0))
 
     def test_failure_missing_entries(self, mock_transformer_model):
         """Test that GRPO fails when required keys are missing but works without optional keys."""
@@ -861,67 +863,45 @@ class TestLosses:
         with pytest.raises(KeyError, match="Couldn't find the ref log-prob"):
             loss_fn_with_kl(data_missing_ref_for_kl)
 
-    def test_cispo(self, mock_transformer_model):
-        """Test CISPO loss computation with mock models."""
-        vocab_size = 1024
-        device = torch.device("cpu")
-        eps = 0.20
-
-        # Create mock model and wrap it
-        model = mock_transformer_model(vocab_size=vocab_size, device=device)
-        actor_network = TransformersWrapper(
-            model,
-            generate=False,
-            pad_output=True,
-            input_mode="history",
+    def test_cispo_clips_importance_weight(self):
+        data = _policy_loss_data(
+            current_log_prob=[torch.log(torch.tensor(0.5))],
+            sample_log_prob=[0.0],
+            advantage=[1.0],
+        )
+        loss = CISPOLoss(_FixedLogProbPolicy(), clip_epsilon=0.2, entropy_bonus=False)(
+            data
         )
 
-        # Create loss module
+        torch.testing.assert_close(loss.loss_objective, torch.tensor(-0.8))
 
-        loss_fn = CISPOLoss(actor_network, clip_epsilon=eps)
 
-        # Create fake data
-        data = _mock_data_grpo(vocab_size=vocab_size, device=device)
+class _FixedSFTPolicy(torch.nn.Module):
+    def __init__(self, log_probs):
+        super().__init__()
+        self.register_buffer("log_probs", log_probs)
 
-        # Compute loss
-        loss_vals = loss_fn(data)
+    def forward(self, tensordict):
+        return TensorDict(
+            {("log_probs", "full"): self.log_probs},
+            batch_size=[self.log_probs.shape[0]],
+        )
 
-        # Assertions: Check output type and structure
 
-        assert isinstance(
-            loss_vals, CISPOLossOutput
-        ), f"Expected CISPOLossOutput, got {type(loss_vals)}"
-
-        # Check that all expected keys are present (same as GRPO)
-        assert hasattr(loss_vals, "loss_objective"), "Missing loss_objective"
-        assert hasattr(loss_vals, "clip_fraction"), "Missing clip_fraction"
-        assert hasattr(loss_vals, "kl_approx"), "Missing kl_approx"
-        assert hasattr(loss_vals, "ESS"), "Missing ESS"
-        assert hasattr(loss_vals, "entropy"), "Missing entropy"
-        assert hasattr(loss_vals, "loss_entropy"), "Missing loss_entropy"
-
-        # Check tensor shapes (all losses should be scalars after reduction)
-        assert (
-            loss_vals.loss_objective.shape == ()
-        ), f"loss_objective should be scalar, got {loss_vals.loss_objective.shape}"
-        assert (
-            loss_vals.clip_fraction.shape == ()
-        ), f"clip_fraction should be scalar, got {loss_vals.clip_fraction.shape}"
-        assert (
-            loss_vals.kl_approx.shape == ()
-        ), f"kl_approx should be scalar, got {loss_vals.kl_approx.shape}"
-        assert (
-            loss_vals.ESS.shape == ()
-        ), f"ESS should be scalar, got {loss_vals.ESS.shape}"
-
-        # Check that losses are finite
-        assert torch.isfinite(loss_vals.loss_objective), "loss_objective is not finite"
-        assert torch.isfinite(loss_vals.ESS), "ESS is not finite"
-
-        # Check that clip_fraction is in valid range [0, 1]
-        assert (
-            0 <= loss_vals.clip_fraction <= 1
-        ), f"clip_fraction out of range: {loss_vals.clip_fraction}"
+def _sft_loss_data(ref_log_probs=None):
+    data = TensorDict(
+        {
+            ("history", "full"): torch.zeros(2, 1),
+            ("masks", "all_assistant_mask"): torch.tensor(
+                [[True, False], [True, True]]
+            ),
+            ("masks", "all_attention_mask"): torch.ones(2, 2, dtype=torch.bool),
+        },
+        batch_size=[2],
+    )
+    if ref_log_probs is not None:
+        data[("next", "ref_log_probs", "full")] = ref_log_probs
+    return data
 
 
 class TestSFT:
@@ -999,63 +979,75 @@ class TestSFT:
     @pytest.mark.skipif(
         not _has_transformers, reason="transformers lib required to test SFT"
     )
-    @pytest.mark.parametrize("loss_function", ["sft", "minor_sft"])
-    @pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
-    @pytest.mark.parametrize("normalize_by_seq_length", [True, False])
-    @pytest.mark.parametrize("kl_to_ref_coeff", [None, 0.1])
-    def test_sft(
-        self,
-        loss_function,
-        reduction,
-        normalize_by_seq_length,
-        kl_to_ref_coeff,
-        data,
-        policy_train,
-    ):
+    def test_sft(self, data, policy_train):
         policy_train, tokenizer = policy_train
         loss = SFTLoss(
             actor_network=policy_train,
             tokenizer=tokenizer,
-            reduction=reduction,
-            normalize_by_seq_length=normalize_by_seq_length,
-            kl_to_ref_coeff=kl_to_ref_coeff if loss_function != "minor_sft" else None,
-            loss_function=loss_function,
-            beta=0.1,
             tokenizer_kwargs={"chat_template_name": "qwen"},
         )
 
-        td = data
-        if kl_to_ref_coeff is not None or loss_function == "minor_sft":
-            policy_ref = TransformersWrapper(
-                policy_train.model,
-                tokenizer=tokenizer,
-                generate=False,
-                return_log_probs=True,
-                chat_template_name="qwen",
-                input_mode="history",
-                pad_output=False,
-            )
-            transform = RetrieveLogProb(
-                policy_ref,
-                assistant_only=True,
-                tokenizer_kwargs={"chat_template_name": "qwen"},
-                tokenizer=tokenizer,
-                log_probs_full_key=("ref_log_probs", "full"),
-            )
-            with torch.no_grad():
-                # Compute ref log-probs
-                transform(td)
-        loss_vals = loss(td)
-        if kl_to_ref_coeff is not None and loss_function != "minor_sft":
-            assert loss_vals.loss_kl_to_ref.shape == ()
-            assert loss_vals.kl_to_ref.shape == ()
-        if reduction == "mean":
-            assert loss_vals.loss_sft.shape == ()
-        elif reduction == "sum":
-            assert loss_vals.loss_sft.shape == ()
-        elif reduction == "none":
-            assert loss_vals.loss_sft.shape == (2,)
+        loss_vals = loss(data)
+        assert loss_vals.loss_sft.shape == ()
         assert loss_vals.sum(reduce=True).shape == ()
+
+    @pytest.mark.parametrize(
+        "normalize_by_seq_length,reduction,expected",
+        [
+            (True, "none", [2.0, 2.0]),
+            (False, "none", [2.0, 4.0]),
+            (False, "mean", 3.0),
+            (False, "sum", 6.0),
+        ],
+    )
+    def test_sft_reduction_and_sequence_normalization(
+        self, normalize_by_seq_length, reduction, expected
+    ):
+        policy = _FixedSFTPolicy(torch.tensor([[-2.0, -100.0], [-1.0, -3.0]]))
+        loss = SFTLoss(
+            policy,
+            tokenizer=object(),
+            normalize_by_seq_length=normalize_by_seq_length,
+            reduction=reduction,
+        )(_sft_loss_data())
+
+        torch.testing.assert_close(loss.loss_sft, torch.tensor(expected))
+
+    def test_minor_sft_uses_reference_log_probs(self):
+        policy = _FixedSFTPolicy(torch.tensor([[-2.0, -100.0], [-1.0, -3.0]]))
+        data = _sft_loss_data(ref_log_probs=torch.tensor([[-4.0, 0.0], [-1.0, -1.0]]))
+        loss = SFTLoss(
+            policy,
+            tokenizer=object(),
+            normalize_by_seq_length=False,
+            reduction="none",
+            loss_function="minor_sft",
+            beta=0.5,
+        )(data)
+
+        torch.testing.assert_close(loss.loss_sft, torch.tensor([0.3132617, 1.3132617]))
+
+    def test_sft_kl_to_reference(self):
+        policy = _FixedSFTPolicy(torch.tensor([[-2.0, -100.0], [-1.0, -3.0]]))
+        data = lazy_stack(
+            list(
+                _sft_loss_data(
+                    ref_log_probs=torch.tensor([[-4.0, 0.0], [-1.0, -1.0]])
+                ).unbind(0)
+            )
+        )
+        kl_to_ref_coeff = 0.25
+        loss = SFTLoss(
+            policy,
+            tokenizer=object(),
+            kl_to_ref_coeff=kl_to_ref_coeff,
+        )(data)
+
+        expected_kl = (
+            torch.exp(torch.tensor(-2.0)) + torch.exp(torch.tensor(2.0)) - 2
+        ) / 4
+        torch.testing.assert_close(loss.kl_to_ref, expected_kl)
+        torch.testing.assert_close(loss.loss_kl_to_ref, kl_to_ref_coeff * expected_kl)
 
     def test_sft_assistant_only(self, data):
         from transformers import AutoTokenizer, OPTConfig, OPTForCausalLM
@@ -1096,6 +1088,41 @@ class TestSFT:
             tokenizer_kwargs={"chat_template_name": "qwen"},
         )
         loss(td)
+
+    def test_sft_constructor_device_does_not_move_actor(self):
+        policy = _FixedSFTPolicy(torch.tensor([[-2.0, -100.0], [-1.0, -3.0]]))
+        loss = SFTLoss(policy, tokenizer=object(), device="meta")
+        assert policy.log_probs.device.type == "cpu"
+        assert all(value.device.type == "cpu" for value in loss.state_dict().values())
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.skipif(
+        not _has_transformers, reason="transformers lib required to test SFT"
+    )
+    def test_sft_to_follows_module_device(self, data):
+        from transformers import AutoTokenizer, OPTConfig, OPTForCausalLM
+
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m")
+        tokenizer.pad_token = tokenizer.eos_token
+        policy = TransformersWrapper(
+            OPTForCausalLM(OPTConfig()).eval(),
+            tokenizer=tokenizer,
+            generate=False,
+            chat_template_name="qwen",
+            input_mode="history",
+            pad_output=False,
+        )
+        loss = SFTLoss(
+            actor_network=policy,
+            tokenizer=tokenizer,
+            tokenizer_kwargs={"chat_template_name": "qwen"},
+            device="cpu",
+        )
+        loss.to(torch.device("cuda"))
+        loss_vals = loss(data)
+        assert loss_vals.loss_sft.device.type == "cuda"
+        assert torch.isfinite(loss_vals.loss_sft)
 
 
 class TestDistillation:
@@ -1379,6 +1406,42 @@ class TestDistillation:
         )
         with pytest.raises(KeyError, match="Teacher log-probs"):
             loss_fn(data.clone())
+
+    def test_distillation_constructor_device_does_not_move_actor(self):
+        student = TensorDictModule(
+            torch.nn.Linear(3, 3, bias=False),
+            in_keys=[("history", "full")],
+            out_keys=[("log_probs", "full")],
+        )
+        loss_fn = DistillationLoss(actor_network=student, device="meta")
+        assert next(student.parameters()).device.type == "cpu"
+        assert all(
+            value.device.type == "cpu" for value in loss_fn.state_dict().values()
+        )
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.skipif(
+        not _has_transformers, reason="transformers lib required to test distillation"
+    )
+    def test_distillation_to_follows_module_device(self, data):
+        from transformers import OPTConfig, OPTForCausalLM
+
+        student, tokenizer = self._make_student()
+        teacher_model = OPTForCausalLM(OPTConfig()).eval()
+        td = data.clone()
+        self._write_teacher_log_probs(td, teacher_model, tokenizer)
+        loss_fn = DistillationLoss(
+            actor_network=student,
+            tokenizer=tokenizer,
+            tokenizer_kwargs={"chat_template_name": "qwen"},
+            device="cpu",
+        )
+        loss_fn.to(torch.device("cuda"))
+        td = td.to("cuda")
+        loss_vals = loss_fn(td)
+        assert loss_vals.loss_distill.device.type == "cuda"
+        assert torch.isfinite(loss_vals.loss_distill)
 
 
 @pytest.mark.slow

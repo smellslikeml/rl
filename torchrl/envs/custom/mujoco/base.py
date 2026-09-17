@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import abc
 import re
+from collections.abc import Sequence
 from copy import copy
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -22,6 +23,7 @@ from typing import Any, ClassVar, Literal
 import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
+from torchrl._utils import seed_generator
 from torchrl.data.tensor_specs import Binary, Bounded, Composite, Unbounded
 from torchrl.envs.common import _EnvPostInit, EnvBase
 from torchrl.envs.custom.mujoco._backends import (
@@ -155,14 +157,23 @@ class _MujocoMeta(_EnvPostInit):
                 inner_kwargs = dict(kwargs)
                 inner_kwargs["num_envs"] = 1
 
-                def _factory(_args=args, _kwargs=inner_kwargs):
+                def _factory(_args=args, _kwargs=inner_kwargs, **worker_kwargs):
                     # Re-enters this metaclass with N=1 -> falls through.
-                    return cls(*_args, **_kwargs)
+                    return cls(*_args, **{**_kwargs, **worker_kwargs})
 
+                # Chain one seed per worker, as EnvBase.set_seed does across a
+                # batch, so workers draw distinct reset noise from one seed.
+                seed = kwargs.get("seed")
+                worker_kwargs = []
+                for _ in range(n):
+                    worker_kwargs.append({} if seed is None else {"seed": seed})
+                    seed = None if seed is None else seed_generator(seed)
                 parallel_kwargs = (
                     {"metadata_from_workers": True} if wrap_cls is ParallelEnv else {}
                 )
-                return wrap_cls(n, _factory, **parallel_kwargs)
+                return wrap_cls(
+                    n, _factory, create_env_kwargs=worker_kwargs, **parallel_kwargs
+                )
             # Single env: pass through.
             return super().__call__(*args, **kwargs)
 
@@ -187,6 +198,11 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
 
     Args:
         xml_path: optional override for the XML asset (path or URL).
+        patch_xml: if ``True`` (default), load the XML as text and apply
+            :meth:`_patch_xml`. If ``False``, pass a local ``xml_path`` to
+            MuJoCo unchanged so relative includes, meshes, textures, and other
+            assets resolve from the model directory. Remote URLs are still
+            loaded as text and therefore must be self-contained.
         backend: ``"mujoco-torch"`` (default), ``"mjx"``, or ``"mujoco"``.
         num_envs: batch size; the env's ``batch_size`` is ``(num_envs,)``.
         device: torch device for observations / rewards / actions.
@@ -206,6 +222,9 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
         compile_step: when ``backend="mujoco-torch"``, wrap the per-env
             physics step in :func:`torch.compile`. Ignored otherwise.
         compile_kwargs: forwarded to :func:`torch.compile` when applicable.
+            ``fullgraph=True`` is used unless overridden, so a graph break in
+            the physics step raises instead of silently falling back to eager
+            fragments.
         from_pixels: if ``True``, include a ``"pixels"`` observation rendered
             from MuJoCo at reset and after every step.
         pixels_only: if ``True``, return only the ``"pixels"`` observation.
@@ -255,6 +274,7 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
         self,
         *,
         xml_path: str | Path | None = None,
+        patch_xml: bool = True,
         backend: Literal["mujoco-torch", "mjx", "mujoco"] = "mujoco-torch",
         num_envs: int = 1,
         device: torch.device | None = None,
@@ -296,10 +316,10 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
         self._render_counter = 0
         self.camera_id = int(camera_id)
 
-        xml_string = self._load_xml(xml_path)
+        source = self._load_xml(xml_path, patch_xml=patch_xml)
         self._backend: _PhysicsBackend = make_backend(
             backend,
-            xml_string,
+            source,
             num_envs=num_envs,
             device=self.device,
             compile_step=compile_step,
@@ -317,7 +337,27 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
     # XML resolution + patching
     # ------------------------------------------------------------------
 
-    def _load_xml(self, xml_path: str | Path | None) -> str:
+    def _resolve_xml_candidate(
+        self,
+        candidate: str | Path,
+        *,
+        patch_xml: bool,
+    ) -> str | Path:
+        value = str(candidate)
+        if not patch_xml and not value.startswith(("http://", "https://")):
+            path = Path(candidate).expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            return path.resolve()
+        xml = resolve_xml_string(candidate)
+        return self._patch_xml(xml) if patch_xml else xml
+
+    def _load_xml(
+        self,
+        xml_path: str | Path | None,
+        *,
+        patch_xml: bool = True,
+    ) -> str | Path:
         # An explicit ``xml_path=...`` is treated as a hard request: if
         # it can't be resolved, surface the error rather than silently
         # falling back to the class-level defaults. Subclass-level
@@ -325,7 +365,7 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
         # the last failure preserved as ``__cause__``.
         if xml_path is not None:
             try:
-                return self._patch_xml(resolve_xml_string(xml_path))
+                return self._resolve_xml_candidate(xml_path, patch_xml=patch_xml)
             except OSError as e:
                 raise FileNotFoundError(
                     f"{type(self).__name__}: explicit xml_path={xml_path!r} "
@@ -348,8 +388,7 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
         last_exc: Exception | None = None
         for cand in candidates:
             try:
-                xml_string = resolve_xml_string(cand)
-                return self._patch_xml(xml_string)
+                return self._resolve_xml_candidate(cand, patch_xml=patch_xml)
             except OSError as e:
                 last_exc = e
         raise FileNotFoundError(
@@ -594,6 +633,50 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
             environment batch size.
         """
         return self._state_td().clone()
+
+    def _mujoco_ids(
+        self, kind: Literal["geom", "site"], names: Sequence[str]
+    ) -> list[int]:
+        import mujoco
+
+        obj_type = {
+            "geom": mujoco.mjtObj.mjOBJ_GEOM,
+            "site": mujoco.mjtObj.mjOBJ_SITE,
+        }[kind]
+        model = self._backend.mj_model
+        ids = []
+        for name in names:
+            obj_id = mujoco.mj_name2id(model, obj_type, name)
+            if obj_id < 0:
+                raise KeyError(f"The MuJoCo model has no {kind} named {name!r}.")
+            ids.append(int(obj_id))
+        return ids
+
+    def geom_contacts(self, geom_names: Sequence[str]) -> torch.Tensor:
+        """Report which of the named geoms currently touch another geom.
+
+        A geom counts as touching when it takes part in an active contact
+        whose distance is non-positive. Useful for contact-based gait metrics
+        such as foot-strike detection.
+
+        Args:
+            geom_names: MuJoCo geom names to query.
+
+        Returns:
+            A ``(num_envs, len(geom_names))`` boolean tensor.
+        """
+        return self._backend.geom_contacts(self._mujoco_ids("geom", geom_names))
+
+    def site_positions(self, site_names: Sequence[str]) -> torch.Tensor:
+        """Return the world-frame positions of the named sites.
+
+        Args:
+            site_names: MuJoCo site names to query.
+
+        Returns:
+            A ``(num_envs, len(site_names), 3)`` tensor of xyz positions.
+        """
+        return self._backend.site_positions(self._mujoco_ids("site", site_names))
 
     def _index_extra_state(self, index: slice | torch.Tensor) -> dict[str, Any]:
         """Return subclass-owned batched state for an indexed env snapshot."""
