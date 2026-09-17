@@ -20,6 +20,7 @@ from torchrl.data.llm.history import _CHAT_TEMPLATES
 from torchrl.envs.llm.transforms.kl import RetrieveLogProb
 from torchrl.modules.llm import TransformersWrapper, vLLMWrapper
 from torchrl.modules.llm.policies.common import ChatHistory, Masks, Text, Tokens
+from torchrl.objectives.llm import GSPOLoss, GSPOLossOutput
 from torchrl.objectives.llm.distillation import (
     _distillation_loss,
     DistillationLoss,
@@ -874,6 +875,91 @@ class TestLosses:
         )
 
         torch.testing.assert_close(loss.loss_objective, torch.tensor(-0.8))
+
+    def test_gspo_sequence_level_importance_weight(self):
+        # GSPO replaces GRPO's token-level importance ratio with one
+        # length-normalized log-ratio per sequence (the log geometric-mean
+        # ratio over the response tokens), clipped at the sequence level by
+        # the inherited surrogate. The two sequences have different valid
+        # lengths; masked positions carry NaN sampling log-probs (as the
+        # generate path produces) and arbitrary current log-probs that must
+        # stay out of the ratio.
+        current_log_prob = torch.log(
+            torch.tensor([[1.2, 1.5, 3.0, 3.0], [0.5, 4.0, 4.0, 4.0]])
+        )
+        sample_log_prob = torch.tensor(
+            [
+                [0.0, 0.0, float("nan"), float("nan")],
+                [0.0, float("nan"), float("nan"), float("nan")],
+            ]
+        )
+        response_mask = torch.tensor(
+            [[True, True, False, False], [True, False, False, False]]
+        )
+        advantage = torch.ones(2, 4)
+        data = TensorDict(
+            {
+                "current_log_prob": current_log_prob,
+                "mask": response_mask,
+                ("tokens", "full"): torch.zeros(2, 4, dtype=torch.long),
+                ("log_probs", "full"): sample_log_prob,
+                "advantage": advantage.unsqueeze(-1),
+            },
+            batch_size=[2],
+        )
+        loss = GSPOLoss(_FixedLogProbPolicy(), entropy_bonus=False)(data)
+
+        assert isinstance(loss, GSPOLossOutput)
+        for field in ("loss_objective", "clip_fraction", "kl_approx", "ESS"):
+            value = getattr(loss, field)
+            assert value.shape == ()
+            assert torch.isfinite(value)
+
+        # Parity oracle: the sequence-level formula of trl's
+        # importance_sampling_level="sequence" branch (grpo_loss.py),
+        # computed inline from the same inputs.
+        log_ratio = torch.where(
+            response_mask, current_log_prob - sample_log_prob, 0.0
+        )
+        seq_lengths = response_mask.sum(-1).clamp(min=1.0)
+        seq_log_ratio = (log_ratio * response_mask).sum(-1) / seq_lengths
+        ratio = seq_log_ratio.exp()
+        # GSPO paper Sec. 5.1 clipping ranges (the GSPOLoss defaults)
+        clipped = ratio.clamp(1 - 3e-4, 1 + 4e-4)
+        per_token_gain = torch.minimum(
+            ratio.unsqueeze(-1) * advantage, clipped.unsqueeze(-1) * advantage
+        )
+        expected = -(per_token_gain * response_mask).sum() / response_mask.sum()
+        torch.testing.assert_close(loss.loss_objective, expected)
+        # both sequence ratios fall outside the tight sequence-level bounds
+        torch.testing.assert_close(loss.clip_fraction, torch.tensor(1.0))
+
+    def test_gspo_gradients_flow_through_valid_tokens(self):
+        current_log_prob = torch.log(
+            torch.tensor([[1.001, 0.999, 3.0]])
+        ).requires_grad_()
+        sample_log_prob = torch.tensor([[0.0, 0.0, float("nan")]])
+        response_mask = torch.tensor([[True, True, False]])
+        data = TensorDict(
+            {
+                "current_log_prob": current_log_prob,
+                "mask": response_mask,
+                ("tokens", "full"): torch.zeros(1, 3, dtype=torch.long),
+                ("log_probs", "full"): sample_log_prob,
+                "advantage": torch.ones(1, 3, 1),
+            },
+            batch_size=[1],
+        )
+        loss = GSPOLoss(_FixedLogProbPolicy(), entropy_bonus=False)(data)
+        loss.loss_objective.backward()
+
+        grad = current_log_prob.grad
+        assert grad.shape == (1, 3)
+        assert torch.isfinite(grad).all()
+        # the length-normalized ratio carries gradient from the valid tokens
+        assert (grad[0, :2].abs() > 0).all()
+        # masked-out positions stay out of the sequence ratio
+        assert torch.equal(grad[0, 2:], torch.zeros(1))
 
 
 class _FixedSFTPolicy(torch.nn.Module):
