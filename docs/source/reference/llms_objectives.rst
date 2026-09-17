@@ -16,6 +16,8 @@ GRPO
 
     GRPOLoss
     GRPOLossOutput
+    GSPOLoss
+    GSPOLossOutput
     MCAdvantage
     MCAdvantageSelector
     RayMCAdvantage

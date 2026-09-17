@@ -157,6 +157,10 @@ class CISPOLossOutput(LLMLossOutput):
     """CISPO Loss Output."""
 
 
+class GSPOLossOutput(LLMLossOutput):
+    """GSPO Loss Output."""
+
+
 class MCAdvantageSelector:
     """Select trajectories from an oversampled Monte-Carlo advantage group.
 
@@ -1043,6 +1047,110 @@ class CISPOLoss(GRPOLoss):
         ratio = log_weight_clip.exp()
         gain = ratio * advantage
         return -gain, clip_fraction
+
+
+class GSPOLoss(GRPOLoss):
+    """GSPO (Group Sequence Policy Optimization) loss.
+
+    GSPO computes the importance ratio at the *sequence* level: the per-token
+    log-ratios between the current and the sampling policy are reduced over the
+    response tokens of each sequence to a length-normalized (geometric-mean)
+    log-ratio, and that per-sequence weight enters the clipped surrogate::
+
+        weight_i = exp( sum_t mask_it * log(pi/pi_old)_it / max(sum_t mask_it, 1) )
+
+        loss = -min( weight * advantage, min(max(weight, 1-eps_low), 1+eps_high) * advantage)
+
+    The per-sequence ``weight_i`` is broadcast back over the token positions of
+    its sequence, so the clipping inherited from :class:`GRPOLoss` operates at
+    the sequence level (Eq. (5) of the paper) rather than the token level.
+    Masking, ESS, entropy and the optional KL penalties are inherited
+    unchanged.
+
+    The sequence-level ratio is ported with attribution from the
+    ``importance_sampling_level="sequence"`` branch of
+    ``trl/losses/grpo_loss.py``
+    (`HuggingFace trl <https://github.com/huggingface/trl>`_, Apache-2.0).
+    See the `GSPO: Group Sequence Policy Optimization
+    <https://arxiv.org/abs/2507.18071>`_ paper (Qwen team).
+
+    Args:
+        actor_network (LLMWrapperBase): policy operator.
+
+    Keyword Args:
+        clip_epsilon (float | tuple[float, float], optional): clipping
+            threshold(s) for the sequence-level surrogate. The
+            length-normalized ratio concentrates much closer to 1 than GRPO's
+            token-level ratio, so GSPO uses tighter bounds than GRPO's ``0.2``:
+            the paper's recommended left/right clipping ranges of ``3e-4`` /
+            ``4e-4`` (Sec. 5.1) are the default here. A float ``x`` gives
+            symmetric ``[1 - x, 1 + x]`` clipping; a tuple ``(eps_low,
+            eps_high)`` gives asymmetric ``[1 - eps_low, 1 + eps_high]``
+            clipping.
+        **kwargs: keyword arguments forwarded to :class:`GRPOLoss`.
+
+    Examples:
+        >>> import types
+        >>> import torch
+        >>> from tensordict import TensorDict
+        >>> from torchrl.objectives.llm import GSPOLoss
+        >>> policy = types.SimpleNamespace(
+        ...     in_keys=(),
+        ...     get_dist=lambda tensordict, **kwargs: types.SimpleNamespace(
+        ...         log_prob=lambda value: tensordict["current_log_prob"],
+        ...         mask=tensordict["mask"],
+        ...     ),
+        ... )
+        >>> data = TensorDict(
+        ...     {
+        ...         "current_log_prob": torch.log(torch.tensor([[1.2, 1 / 1.2]])),
+        ...         "mask": torch.ones(1, 2, dtype=torch.bool),
+        ...         ("tokens", "full"): torch.zeros(1, 2, dtype=torch.long),
+        ...         ("log_probs", "full"): torch.zeros(1, 2),
+        ...         "advantage": torch.ones(1, 2, 1),
+        ...     },
+        ...     batch_size=[1],
+        ... )
+        >>> loss = GSPOLoss(policy, entropy_bonus=False)(data)
+        >>> type(loss).__name__
+        'GSPOLossOutput'
+        >>> # token ratios 1.2 and 1/1.2 cancel: the sequence-level ratio is 1
+        >>> torch.testing.assert_close(loss.loss_objective, torch.tensor(-1.0))
+
+    """
+
+    output_type: type[LLMLossOutput] = GSPOLossOutput
+
+    def __init__(
+        self,
+        actor_network: LLMWrapperBase | None = None,
+        *,
+        clip_epsilon: float | tuple[float, float] = (3e-4, 4e-4),
+        **kwargs,
+    ):
+        super().__init__(actor_network, clip_epsilon=clip_epsilon, **kwargs)
+
+    def _log_weight(
+        self, tensordict: TensorDictBase, adv_shape: torch.Size
+    ) -> tuple[torch.Tensor, d.Distribution, torch.Tensor, torch.Tensor]:
+        log_weight, dist, kl_approx, attention_mask = super()._log_weight(
+            tensordict, adv_shape
+        )
+        # GSPO: reduce the (already masked) token-level log-ratio to one
+        # length-normalized value per sequence -- the log of the
+        # geometric-mean ratio -- and broadcast it back over that sequence's
+        # token positions, so the inherited _compute_policy_objective clips at
+        # the sequence level. Ported from the
+        # importance_sampling_level="sequence" branch of trl's
+        # grpo_loss.py (Apache-2.0).
+        token_log_weight = log_weight.squeeze(-1)
+        response_mask = attention_mask.to(token_log_weight.dtype)
+        seq_length = response_mask.sum(-1, keepdim=True).clamp_min(1.0)
+        seq_log_weight = (
+            (token_log_weight * response_mask).sum(-1, keepdim=True) / seq_length
+        )
+        log_weight = seq_log_weight.unsqueeze(-1).expand_as(log_weight)
+        return log_weight, dist, kl_approx, attention_mask
 
 
 class MCAdvantage(Transform):
