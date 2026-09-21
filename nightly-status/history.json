@@ -1,21 +1,21 @@
 {
-  "last_updated": "2026-09-21T06:12:10.402388+00:00",
+  "last_updated": "2026-09-21T06:15:53.623780+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
       "runs_with_data": 7,
-      "total_workflow_runs": 66,
+      "total_workflow_runs": 68,
       "total_success": 60,
-      "total_failure": 6,
-      "success_rate": 90.9
+      "total_failure": 8,
+      "success_rate": 88.2
     },
     "last_30_days": {
       "days": 30,
       "runs_with_data": 30,
-      "total_workflow_runs": 296,
+      "total_workflow_runs": 298,
       "total_success": 250,
-      "total_failure": 46,
-      "success_rate": 84.5
+      "total_failure": 48,
+      "success_rate": 83.9
     }
   },
   "history": [
@@ -105,21 +105,21 @@
           "display_name": "Nightly Build"
         },
         "build-wheels-linux.yml": {
-          "status": "success",
-          "conclusion": "success",
+          "status": "failure",
+          "conclusion": "failure",
           "url": "https://github.com/smellslikeml/rl/actions/runs/35567401659/job/106231895743",
           "display_name": "Wheels (Linux)"
         },
         "build-wheels-m1.yml": {
-          "status": "skipped",
-          "conclusion": null,
-          "url": null,
+          "status": "failure",
+          "conclusion": "failure",
+          "url": "https://github.com/smellslikeml/rl/actions/runs/35567401659/job/106232114418",
           "display_name": "Wheels (M1)"
         },
         "build-wheels-windows.yml": {
-          "status": "skipped",
-          "conclusion": null,
-          "url": null,
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/smellslikeml/rl/actions/runs/35567401659/job/106232419338",
           "display_name": "Wheels (Windows)"
         },
         "build-wheels-aarch64-linux.yml": {
@@ -132,10 +132,10 @@
       "summary": {
         "total": 17,
         "success": 9,
-        "failure": 0,
-        "skipped": 8,
+        "failure": 2,
+        "skipped": 6,
         "other": 0,
-        "success_rate": 100.0
+        "success_rate": 81.8
       }
     },
     {
