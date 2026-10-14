@@ -1,24 +1,143 @@
 {
-  "last_updated": "2026-10-13T18:09:01.231525+00:00",
+  "last_updated": "2026-10-14T18:08:14.628497+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
       "runs_with_data": 7,
-      "total_workflow_runs": 33,
-      "total_success": 27,
-      "total_failure": 6,
-      "success_rate": 81.8
+      "total_workflow_runs": 21,
+      "total_success": 18,
+      "total_failure": 3,
+      "success_rate": 85.7
     },
     "last_30_days": {
       "days": 30,
       "runs_with_data": 30,
-      "total_workflow_runs": 267,
-      "total_success": 230,
-      "total_failure": 37,
-      "success_rate": 86.1
+      "total_workflow_runs": 256,
+      "total_success": 222,
+      "total_failure": 34,
+      "success_rate": 86.7
     }
   },
   "history": [
+    {
+      "date": "2026-10-14",
+      "orchestrator_ran": true,
+      "orchestrator_status": "failure",
+      "orchestrator_url": "https://github.com/smellslikeml/rl/actions/runs/38520495606",
+      "orchestrator_run_id": 38520495606,
+      "workflows": {
+        "test-linux.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Linux Tests"
+        },
+        "test-linux-llm.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "LLM Tests"
+        },
+        "test-linux-habitat.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Habitat Tests"
+        },
+        "test-linux-tutorials.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Tutorials Tests"
+        },
+        "test-linux-examples.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Examples Tests"
+        },
+        "test-linux-sota.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "SOTA Tests"
+        },
+        "test-linux-libs.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Libs Tests"
+        },
+        "test-windows-optdepts.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Windows Tests"
+        },
+        "lint.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Lint"
+        },
+        "docs.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Documentation"
+        },
+        "benchmarks.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Benchmarks"
+        },
+        "validate-test-partitioning.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Test Partitioning"
+        },
+        "nightly_build.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Nightly Build"
+        },
+        "build-wheels-linux.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (Linux)"
+        },
+        "build-wheels-m1.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (M1)"
+        },
+        "build-wheels-windows.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (Windows)"
+        },
+        "build-wheels-aarch64-linux.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (Aarch64)"
+        }
+      },
+      "summary": {
+        "total": 17,
+        "success": 0,
+        "failure": 0,
+        "skipped": 17,
+        "other": 0,
+        "success_rate": null
+      }
+    },
     {
       "date": "2026-10-13",
       "orchestrator_ran": true,
@@ -10236,119 +10355,6 @@
         "skipped": 2,
         "other": 1,
         "success_rate": 50.0
-      }
-    },
-    {
-      "date": "2026-07-16",
-      "orchestrator_ran": true,
-      "orchestrator_status": "failure",
-      "orchestrator_url": "https://github.com/pytorch/rl/actions/runs/29478355679",
-      "orchestrator_run_id": 29478355679,
-      "workflows": {
-        "test-linux.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556265669",
-          "display_name": "Linux Tests"
-        },
-        "test-linux-llm.yml": {
-          "status": "skipped",
-          "conclusion": "skipped",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556267635",
-          "display_name": "LLM Tests"
-        },
-        "test-linux-habitat.yml": {
-          "status": "skipped",
-          "conclusion": "skipped",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556267650",
-          "display_name": "Habitat Tests"
-        },
-        "test-linux-tutorials.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556265553",
-          "display_name": "Tutorials Tests"
-        },
-        "test-linux-sota.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556265580",
-          "display_name": "SOTA Tests"
-        },
-        "test-linux-libs.yml": {
-          "status": "cancelled",
-          "conclusion": "cancelled",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556265626",
-          "display_name": "Libs Tests"
-        },
-        "test-windows-optdepts.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556265639",
-          "display_name": "Windows Tests"
-        },
-        "lint.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556264979",
-          "display_name": "Lint"
-        },
-        "docs.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556265624",
-          "display_name": "Documentation"
-        },
-        "benchmarks.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556264866",
-          "display_name": "Benchmarks"
-        },
-        "validate-test-partitioning.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556264678",
-          "display_name": "Test Partitioning"
-        },
-        "nightly_build.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556264789",
-          "display_name": "Nightly Build"
-        },
-        "build-wheels-linux.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87556265218",
-          "display_name": "Wheels (Linux)"
-        },
-        "build-wheels-m1.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87559778155",
-          "display_name": "Wheels (M1)"
-        },
-        "build-wheels-windows.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87561045200",
-          "display_name": "Wheels (Windows)"
-        },
-        "build-wheels-aarch64-linux.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/pytorch/rl/actions/runs/29478355679/job/87565011414",
-          "display_name": "Wheels (Aarch64)"
-        }
-      },
-      "summary": {
-        "total": 16,
-        "success": 6,
-        "failure": 7,
-        "skipped": 2,
-        "other": 1,
-        "success_rate": 42.9
       }
     }
   ]
