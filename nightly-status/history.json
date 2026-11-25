@@ -1,9 +1,9 @@
 {
-  "last_updated": "2026-11-24T03:40:52.591879+00:00",
+  "last_updated": "2026-11-25T01:47:35.203238+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
-      "runs_with_data": 6,
+      "runs_with_data": 5,
       "total_workflow_runs": 0,
       "total_success": 0,
       "total_failure": 0,
@@ -11,7 +11,7 @@
     },
     "last_30_days": {
       "days": 30,
-      "runs_with_data": 28,
+      "runs_with_data": 27,
       "total_workflow_runs": 0,
       "total_success": 0,
       "total_failure": 0,
@@ -19,6 +19,20 @@
     }
   },
   "history": [
+    {
+      "date": "2026-11-25",
+      "orchestrator_ran": false,
+      "orchestrator_status": "not_run",
+      "orchestrator_url": null,
+      "workflows": {},
+      "summary": {
+        "total": 0,
+        "success": 0,
+        "failure": 0,
+        "skipped": 0,
+        "success_rate": null
+      }
+    },
     {
       "date": "2026-11-24",
       "orchestrator_ran": false,
@@ -10278,119 +10292,6 @@
         "skipped": 8,
         "other": 0,
         "success_rate": 100.0
-      }
-    },
-    {
-      "date": "2026-08-27",
-      "orchestrator_ran": true,
-      "orchestrator_status": "queued",
-      "orchestrator_url": "https://github.com/smellslikeml/rl/actions/runs/33056650009",
-      "orchestrator_run_id": 33056650009,
-      "workflows": {
-        "test-linux.yml": {
-          "status": "skipped",
-          "conclusion": "skipped",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465026610",
-          "display_name": "Linux Tests"
-        },
-        "test-linux-llm.yml": {
-          "status": "skipped",
-          "conclusion": "skipped",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465026670",
-          "display_name": "LLM Tests"
-        },
-        "test-linux-habitat.yml": {
-          "status": "skipped",
-          "conclusion": "skipped",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465026992",
-          "display_name": "Habitat Tests"
-        },
-        "test-linux-tutorials.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465027853",
-          "display_name": "Tutorials Tests"
-        },
-        "test-linux-sota.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465028717",
-          "display_name": "SOTA Tests"
-        },
-        "test-linux-libs.yml": {
-          "status": "skipped",
-          "conclusion": "skipped",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465026881",
-          "display_name": "Libs Tests"
-        },
-        "test-windows-optdepts.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465028753",
-          "display_name": "Windows Tests"
-        },
-        "lint.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465027513",
-          "display_name": "Lint"
-        },
-        "docs.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465028793",
-          "display_name": "Documentation"
-        },
-        "benchmarks.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465025810",
-          "display_name": "Benchmarks"
-        },
-        "validate-test-partitioning.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465026578",
-          "display_name": "Test Partitioning"
-        },
-        "nightly_build.yml": {
-          "status": "skipped",
-          "conclusion": "skipped",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465027534",
-          "display_name": "Nightly Build"
-        },
-        "build-wheels-linux.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465027554",
-          "display_name": "Wheels (Linux)"
-        },
-        "build-wheels-m1.yml": {
-          "status": "failure",
-          "conclusion": "failure",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465373211",
-          "display_name": "Wheels (M1)"
-        },
-        "build-wheels-windows.yml": {
-          "status": "success",
-          "conclusion": "success",
-          "url": "https://github.com/smellslikeml/rl/actions/runs/33056650009/job/98465635150",
-          "display_name": "Wheels (Windows)"
-        },
-        "build-wheels-aarch64-linux.yml": {
-          "status": "skipped",
-          "conclusion": null,
-          "url": null,
-          "display_name": "Wheels (Aarch64)"
-        }
-      },
-      "summary": {
-        "total": 16,
-        "success": 8,
-        "failure": 2,
-        "skipped": 6,
-        "other": 0,
-        "success_rate": 80.0
       }
     }
   ]
